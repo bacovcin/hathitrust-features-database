@@ -3,6 +3,8 @@ import os
 import sys
 import pandas as pd
 import pyrsync2 as rsync
+import pickle
+from itertools import islice
 from htrc_features import FeatureReader
 from htrc_features import utils as htrcutils
 from pyspark import SparkContext
@@ -19,15 +21,21 @@ def extract_database(vol, pos, lang):
     # Only extract English data
     if vol.language == lang or lang == '':
         if pos != '':
-            return [((x[1],x[2],vol.year,vol.pub_place,vol.genre[0]),x[3])
-                    for x in vol.tokenlist(pages=False,
-                                           case=False,
-                                           pos=True).filter(like=pos,axis=0).to_records()]
+            try:
+                return [((x[1],vol.year),x[3])
+                        for x in vol.tokenlist(pages=False,
+                                               case=False,
+                                               pos=True).filter(like=pos,axis=0).to_records()]
+            except:
+                return []
         else:
-            return [((x[1],x[2],vol.year,vol.pub_place,vol.genre[0]),x[3])
-                    for x in vol.tokenlist(pages=False,
-                                           case=False,
-                                           pos=True).to_records()]
+            try:
+                return [((x[1],vol.year),x[3])
+                        for x in vol.tokenlist(pages=False,
+                                               case=False,
+                                               pos=True).to_records()]
+            except:
+                return []
     else:
         return []
 
@@ -40,6 +48,7 @@ if __name__ == "__main__":
     lang = 'eng'
     iters = range(5)
     tmps = 20
+    debug=False
 
     # Set flags if passed as arguments
     for x in sys.argv:
@@ -53,6 +62,8 @@ if __name__ == "__main__":
                 tmps = int(s[1])
             elif s[0] == 'lang':
                 lang = s[1]
+            elif s[0] == 'debug':
+                debug = True
         except:
             continue
 
@@ -68,22 +79,28 @@ if __name__ == "__main__":
 
     # Download temp files "iters" number of times
     for i in iters:
-        # Set flag to limit number of volumes to download
-        j = 0
+        print('Iteration: ' + str(i+1))
+
+        # Create a file with the next set of volumes
+        volsamples = list(islice(vols, tmps))
+        if debug:
+            print(volsamples)
+        outfile = open('sample.txt','w')
+        outfile.write(''.join(volsamples))
+        outfile.close()
 
         # Download files as tmp0-tmpX, overwriting previous tmp files
-        for vol in vols:
-            #print('Downloading volume...')
-            os.system("rsync -av --no-relative data.analytics.hathitrust.org::features/" + 
-                      vol.rstrip() + " ./tmp" + str(j) + " >/dev/null 2>&1")
-            j += 1
-            if j == tmps:
-                j = 0
-                break
+        if debug:
+            os.system("rsync -av --no-relative --files-from sample.txt " +
+                      "data.analytics.hathitrust.org::features/ .")
+        else:
+            os.system("rsync -av --no-relative --files-from sample.txt " +
+                      "data.analytics.hathitrust.org::features/ . >/dev/null 2>&1")
 
         # Get the paths to all the tmp files
-        tmpfiles = glob.glob('./tmp*')
-        print(tmpfiles)
+        tmpfiles = glob.glob('*.bz2')
+        if debug:
+            print(tmpfiles)
 
         # Load the files into the feature reader
         htvols = FeatureReader(tmpfiles)
@@ -94,17 +111,20 @@ if __name__ == "__main__":
         # Extract the relevant Part of Speech tagged data from the volumes
         db = scvols.flatMap(lambda x: extract_database(x, pos, lang))
 
-        if i == 0:
-            # In the first iteration, just aggregate across the volumes
-            rdb = db.reduceByKey(lambda a, b: a+b)
-        else:
-            # Later, combine with previous aggregations
-            # and then aggregate again
-            rdb = db.union(rdb).reduceByKey(lambda a, b: a+b)
 
-        # Save results
-        rdb.saveAsTextFile('output'+str(i)+'-'+str(tmps))
+        if i == 0:
+            outdb = db.reduceByKey(lambda a, b: a+b)
+        else:
+            outdb = outdb.union(db).reduceByKey(lambda a, b: a+b)
 
         # Delete tmp files
         for f in tmpfiles:
             os.remove(f)
+
+    outfile = open('output.txt','w')
+    outfile.write('word\tyear\tcount\n')
+
+    for item in outdb.collect():
+        outfile.write('\t'.join(item[0])+'\t'+str(item[1])+'\n')
+
+    outfile.close()
