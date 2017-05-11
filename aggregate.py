@@ -121,7 +121,7 @@ if __name__ == "__main__":
                 gen = '+'.join(volfile['metadata']['genre'])
                 dL = [x['body']['tokenPosCount']
                       for x in volfile['features']['pages']]
-                vol = sc.parallelize([(k, v)
+                vol = sc.parallelize([(k.lower(), v)
                                       for d in dL
                                       for k, v in d.items()])
                 voldbs.append(vol.flatMap(lambda x: extract_database(x,
