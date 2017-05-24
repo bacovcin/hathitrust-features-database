@@ -1,4 +1,4 @@
-infile = open('output.txt')
+infile = open('all.txt')
 infile.readline()
 forms = {}
 for line in infile:

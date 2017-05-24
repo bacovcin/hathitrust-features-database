@@ -6,7 +6,7 @@ import pandas as pd
 import pyrsync2 as rsync
 from itertools import islice
 from operator import add
-import json
+import ujson
 import bz2
 from pyspark import SparkConf
 from pyspark import SparkContext
@@ -20,21 +20,11 @@ def extract_database(word, year, pp, gen, pos):
     form = word[0]
     wdict = word[1]
     if pos == '':
-        if (form.isalnum() and
-            not form.isdigit() and
-            len(form) >= 3):
-            return [((form,year,pp,gen), sum(wdict.values()))]
-        else:
-            return []
+        return [((form,year,pp,gen), sum(wdict.values()))]
     else:
-        if (form.isalnum() and
-            not form.isdigit() and
-            len(form) >= 3):
-            try:
-                return [((form,year,pp,gen), wdict[pos])]
-            except:
-                return []
-        else:
+        try:
+            return [((form,year,pp,gen), wdict[pos])]
+        except:
             return []
 
 if __name__ == "__main__":
@@ -47,8 +37,9 @@ if __name__ == "__main__":
     # Set defaults for flags
     pos = ''
     lang = 'eng'
-    iters = range(5)
+    iters = 5
     tmps = 20
+    downsize = 1000
     debug=False
     spark = ''
 
@@ -60,6 +51,8 @@ if __name__ == "__main__":
                 pos = s[1]
             elif s[0] == 'iters':
                 iters = int(s[1])
+            elif s[0] == 'downsize':
+                downsize = int(s[1])
             elif s[0] == 'tmps':
                 tmps = int(s[1])
             elif s[0] == 'lang':
@@ -76,26 +69,27 @@ if __name__ == "__main__":
         print('POS: '+pos+'\tIters: '+str(iters)+'\tTmps: '+
               str(tmps)+'\tLang: '+lang+'\n')
 
-    # Create Spark Context
-    sconf = SparkConf().setMaster(spark)
-    sconf.setAppName('HTRC Aggregator')
-    sconf.set("spark.executor.memory", "2g")
-    sconf.set("spark.cores.max", "7")
-    sc = SparkContext(conf=sconf)
-    sc.setLogLevel("ERROR")
-    #sc = SparkContext("local", "HTRC Aggregator")
-
     # Open the list of all htrc volumes
     vols = open('htrc-ef-all-files.txt')
 
     # Run "iters" number of iterations
     i = 0
     while i < iters:
+        print('Iteration: '+str(i+1))
         if debug:
             print('Iteration: ' + str(i+1))
 
+        # Create Spark Context
+        sconf = SparkConf().setMaster(spark)
+        sconf.setAppName('HTRC Aggregator')
+        sconf.set("spark.executor.memory", "2g")
+        sconf.set("spark.cores.max", "7")
+        sc = SparkContext(conf=sconf)
+        sc.setLogLevel("ERROR")
+        #sc = SparkContext("local", "HTRC Aggregator")
+
         # Create a file with the next set of volumes
-        volsamples = list(islice(vols, tmps))
+        volsamples = list(islice(vols, downsize))
         outfile = open('sample.txt','w')
         outfile.write(''.join(volsamples))
         outfile.close()
@@ -110,42 +104,54 @@ if __name__ == "__main__":
 
         # Get the paths to all the tmp files
         tmpfiles = glob.glob('*.bz2')
+        oldfiles = list(tmpfiles)
 
-        voldbs = []
-        # Create a separate RDD for each volume
-        for volname in tmpfiles:
-            volfile = json.load(bz2.open(volname))
-            if volfile['metadata']['language'] == lang or lang == '':
-                year = volfile['metadata']['pubDate']
-                pp = volfile['metadata']['pubPlace']
-                gen = '+'.join(volfile['metadata']['genre'])
-                dL = [x['body']['tokenPosCount']
-                      for x in volfile['features']['pages']]
-                vol = sc.parallelize([(k.lower(), v)
-                                      for d in dL
-                                      for k, v in d.items()])
-                voldbs.append(vol.flatMap(lambda x: extract_database(x,
-                                                                     year,
-                                                                     pp,
-                                                                     lang,
-                                                                     pos)))
+        while len(tmpfiles) > 0:
+            voldbs = []
+            # Create a separate RDD for each volume
+            for j in range(tmps):
+                try:
+                    volname = tmpfiles.pop(0)
+                except IndexError:
+                    continue
+                volfile = ujson.loads(bz2.open(volname).readline())
+                if volfile['metadata']['language'] == lang or lang == '':
+                    year = volfile['metadata']['pubDate']
+                    pp = volfile['metadata']['pubPlace']
+                    gen = '+'.join(volfile['metadata']['genre'])
+                    dL = [x['body']['tokenPosCount']
+                          for x in volfile['features']['pages']]
+                    vol = sc.parallelize([(k.lower(), v)
+                                          for d in dL
+                                          for k, v in d.items()
+                                          if (len(k) >= 3 and
+                                             k.isalnum() and
+                                             not k.isdigit())])
+                    voldbs.append(vol.flatMap(lambda x: extract_database(x,
+                                                                         year,
+                                                                         pp,
+                                                                         lang,
+                                                                         pos)))
 
-        # Combine all the volume RDDs into one large RDD
-        db = sc.union(voldbs)
+            # Combine all the volume RDDs into one large RDD
+            db = sc.union(voldbs)
 
-        # Group identical keys (including from previous batches)
-        try:
-            olddb = sc.parallelize(outs)
-            outdb = olddb.union(db).foldByKey(0,add)
-        except:
-            outdb = db.foldByKey(0, add)
+            # Group identical keys (including from previous batches)
+            try:
+                olddb = sc.parallelize(outs)
+                outdb = olddb.union(db).foldByKey(0,add)
+            except:
+                outdb = db.foldByKey(0, add)
 
-        # Store the current batch's output
-        outs = outdb.collect()
+            # Store the current batch's output
+            outs = outdb.collect()
 
         # Delete tmp files
-        for f in tmpfiles:
+        for f in oldfiles:
             os.remove(f)
+
+        # End the current Spark job
+        sc.stop()
 
         # Increase batch number
         i += 1

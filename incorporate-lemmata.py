@@ -6,7 +6,7 @@ for line in infile:
         lemmata[s[1]] = (s[3],s[4])
 infile.close()
 
-infile = open('output.txt')
+infile = open('all.txt')
 infile.readline()
 new_output = {}
 for line in infile:

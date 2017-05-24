@@ -1,8 +1,8 @@
 output.txt : htrc-ef-all-files.txt aggregate.py
 	@echo --- Extracting features ---
-	python aggregate.py pos=VBD iters=10 tmps=100 spark=spark://hbacovci-linux-desktop:7077
+	python aggregate.py pos=VBD iters=5 tmps=2000 spark=spark://hbacovci-linux-desktop:7077
 
-forms.txt : output.txt extract-forms.py
+forms.txt : all.txt extract-forms.py
 	@echo --- Extracting forms ---
 	python extract-forms.py
 
@@ -25,6 +25,6 @@ lemmata.txt : forms.txt eccoplaintext.properties morphadorner/data/eccolexicon.l
 	mv ./lemmata/forms.txt lemmata.txt && \
 	rm -r ./lemmata
 
-lemma-output.txt : output.txt lemmata.txt incorporate-lemmata.py
+lemma-output.txt : all.txt lemmata.txt incorporate-lemmata.py
 	@echo --- Incorporating lemmata ---
 	python incorporate-lemmata.py
