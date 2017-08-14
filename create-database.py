@@ -1,6 +1,5 @@
 from py4j.java_gateway import JavaGateway
 import glob
-from line_profiler import LineProfiler
 from itertools import islice
 import os
 import multiprocessing as mp
@@ -157,7 +156,6 @@ def worker_init(queue, debug):
         os.remove(volname)
         queue.task_done()
 
-
 def main():
     # Temporarily open the MongoDB database
     with pymongo.MongoClient() as dbclient:
@@ -251,9 +249,9 @@ def main():
                             ('POS',pymongo.ASCENDING)])
     db.metadata.create_index('volumeIdentifier')
 
+    # Deleted temporary files used to interface with MorphAdorner
+    os.remove(glob.glob("*input.csv"))
+    os.remove(glob.glob("*output.txt"))
+
 if __name__ == "__main__":
-    #main()
-    lp = LineProfiler()
-    lp_wrapper = lp(main)
-    lp_wrapper()
-    lp.print_stats()
+    main()
