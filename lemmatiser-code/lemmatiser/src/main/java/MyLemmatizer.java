@@ -1,43 +1,55 @@
-package py4jserver;
+package lemmatizer;
 
+// Import useful java libraries
 import java.io.*;
 import java.net.*;
 import java.util.*;
 
+// Get the relevant MorphAdorner classes
 import edu.northwestern.at.morphadorner.*;
 import edu.northwestern.at.morphadorner.corpuslinguistics.spellingstandardizer.*;
 import edu.northwestern.at.morphadorner.corpuslinguistics.namerecognizer.Names;
 import edu.northwestern.at.morphadorner.corpuslinguistics.lemmatizer.*;
+import edu.northwestern.at.morphadorner.corpuslinguistics.partsofspeech.*;
 import edu.northwestern.at.morphadorner.corpuslinguistics.lexicon.*;
 
-import edu.northwestern.at.utils.*;
-
-public class ServerLemmatiser {
+public class MyLemmatizer {
+	// Get the list of proper names and part of speech tags
 	public Names names = new Names();
+	public NUPOSPartOfSpeechTags nupos;
 
+	// Declare EME objects
 	public Lexicon emeLexicon;
 	public SpellingStandardizer emeStandardizer;
 	public Lemmatizer emeLemmatizer;
 
+	// Declare ECCO objects
 	public Lexicon eceLexicon;
 	public SpellingStandardizer eceStandardizer;
 	public Lemmatizer eceLemmatizer;
 
+	// Declare NCF objects
 	public Lexicon ncfLexicon;
 	public SpellingStandardizer ncfStandardizer;
 	public Lemmatizer ncfLemmatizer;
 
-	public String outfilename;
-
+	// This function opens all of the lexicons and initializes the lemmatizers
+	// and spelling standardizers
 	public void initialise()
 		throws Exception
 	{
+		// Load the part of speech tags
+		nupos = new NUPOSPartOfSpeechTags();
+
+		// Get ready to find the English data in the resources folder
+		ClassLoader classLoader = getClass().getClassLoader();
 
 		System.out.println("Beginning initialisation...");
 
+		// Load the lexicons
 		emeLexicon = new DefaultLexicon();
 
-		URL emelexicon = URLUtils.getURLFromFileNameOrURL("morphadorner/data/emelexicon.lex");
+		URL emelexicon = classLoader.getResource("emelexicon.lex");
 		emeLexicon.loadLexicon
 			(
 			 	emelexicon,
@@ -47,7 +59,7 @@ public class ServerLemmatiser {
 
 		eceLexicon = new DefaultLexicon();
 
-		URL ecelexicon = URLUtils.getURLFromFileNameOrURL("morphadorner/data/eccolexicon.lex");
+		URL ecelexicon = classLoader.getResource("eccolexicon.lex");
 		eceLexicon.loadLexicon
 			(
 			 	ecelexicon,
@@ -57,7 +69,7 @@ public class ServerLemmatiser {
 
 		ncfLexicon = new DefaultLexicon();
 
-		URL ncflexicon = URLUtils.getURLFromFileNameOrURL("morphadorner/data/ncflexicon.lex");
+		URL ncflexicon = classLoader.getResource("ncflexicon.lex");
 		ncfLexicon.loadLexicon
 			(
 			 	ncflexicon,
@@ -65,9 +77,9 @@ public class ServerLemmatiser {
 			);
 		System.out.println("NCF Lexicon loaded...");
 
+		// Set up the spelling standardizers
 		emeStandardizer = new DefaultSpellingStandardizer();
-		//emeStandardizer.setLexicon(emeLexicon);
-		URL standardspellings = URLUtils.getURLFromFileNameOrURL("morphadorner/data/standardspellings.txt");
+		URL standardspellings = classLoader.getResource("standardspellings.txt");
 		emeStandardizer.loadStandardSpellings
 			(
 			 	standardspellings,
@@ -78,7 +90,7 @@ public class ServerLemmatiser {
 		emeStandardizer.addStandardSpellings(names.getSurnames() );
 		emeStandardizer.addStandardSpellings(names.getPlaceNames().keySet() );
 
-		URL spellbwc = URLUtils.getURLFromFileNameOrURL("morphadorner/data/spellingsbywordclass.txt");
+		URL spellbwc = classLoader.getResource("spellingsbywordclass.txt");
 		emeStandardizer.loadAlternativeSpellingsByWordClass
 			(
 			 	spellbwc,
@@ -88,7 +100,6 @@ public class ServerLemmatiser {
 		System.out.println("EME standardizer initialized...");
 	
 		eceStandardizer = new DefaultSpellingStandardizer();
-		//eceStandardizer.setLexicon(eceLexicon);
 		eceStandardizer.loadStandardSpellings
 			(
 			 	standardspellings,
@@ -108,7 +119,6 @@ public class ServerLemmatiser {
 		System.out.println("ECE standardizer initialized...");
 	
 		ncfStandardizer = new DefaultSpellingStandardizer();
-		//ncfStandardizer.setLexicon(ncfLexicon);
 		ncfStandardizer.loadStandardSpellings
 			(
 			 	standardspellings,
@@ -127,6 +137,7 @@ public class ServerLemmatiser {
 
 		System.out.println("NCF standardizer initialized...");
 	
+		// Set up the lemmatizers
 		emeLemmatizer = new DefaultLemmatizer();
 
 		emeLemmatizer.setLexicon(emeLexicon);
@@ -165,28 +176,53 @@ public class ServerLemmatiser {
 		return;
 	}
 
+	// Here is the function for EME lemmatization (the other two functions are
+	// the same but referencing different corpora. I'm only commenting on this
+	// function.
 	public String[] emeLemmatise(String[] args ) 
 		throws Exception
 	{
-		String[] output = new String[5];
-		output[0] = args[0];
-		output[3] = args[3];
-		output[4] = args[4];
+		// Initialize the output
+		String[] output = new String[3];
 
+		// Store the attested form as part of the output
+		output[0] = args[0];
+
+		// Get the standard spelling
 		output[1] = 
 			emeStandardizer.standardizeSpelling
 			(
-			 	args[0],
-				args[1]
+			 	args[0], // the attested form
+				args[1] // the major word class
 			);
+
+		// Get the lemma
 		output[2] = emeLemmatizer.lemmatize( args[0], args[2]);
 
+		// Keep capitalization in standardized spelling
 		if ( output[1].equalsIgnoreCase( args[0] ) )
 		{
 			output[1] = args[0];
 		}
-		if (emeLexicon.containsEntry(output[2])) {
-			return output;
+
+		// Make sure the lemma is an appropriate word for
+		// the word class (i.e., that it occurs in the lexicon
+		// for the given word class, otherwise return null
+		LexiconEntry myEntry = emeLexicon.getLexiconEntry(output[2]);
+		if (myEntry != null) {
+			String[] poses = myEntry.getCategories();
+			for (String s: poses)
+			{
+				String[] wcs = nupos.getMajorWordClass(s).split("/");
+				for (String wc: wcs)
+				{
+					if (wc.equalsIgnoreCase(args[1]))
+					{
+						return output;
+					}
+				}
+			}
+			return null;
 		} else
 		{
 			return null;
@@ -196,10 +232,8 @@ public class ServerLemmatiser {
 	public String[] eceLemmatise(String[] args ) 
 		throws Exception
 	{
-		String[] output = new String[5];
+		String[] output = new String[3];
 		output[0] = args[0];
-		output[3] = args[3];
-		output[4] = args[4];
 
 		output[1] = 
 			eceStandardizer.standardizeSpelling
@@ -213,8 +247,22 @@ public class ServerLemmatiser {
 		{
 			output[1] = args[0];
 		}
-		if (eceLexicon.containsEntry(output[2])) {
-			return output;
+
+		LexiconEntry myEntry = eceLexicon.getLexiconEntry(output[2]);
+		if (myEntry != null) {
+			String[] poses = myEntry.getCategories();
+			for (String s: poses)
+			{
+				String[] wcs = nupos.getMajorWordClass(s).split("/");
+				for (String wc: wcs)
+				{
+					if (wc.equalsIgnoreCase(args[1]))
+					{
+						return output;
+					}
+				}
+			}
+			return null;
 		} else
 		{
 			return null;
@@ -224,10 +272,8 @@ public class ServerLemmatiser {
 	public String[] ncfLemmatise(String[] args ) 
 		throws Exception
 	{
-		String[] output = new String[5];
+		String[] output = new String[3];
 		output[0] = args[0];
-		output[3] = args[3];
-		output[4] = args[4];
 
 		output[1] = 
 			ncfStandardizer.standardizeSpelling
@@ -241,98 +287,24 @@ public class ServerLemmatiser {
 		{
 			output[1] = args[0];
 		}
-		if (ncfLexicon.containsEntry(output[2])) {
-			return output;
+		LexiconEntry myEntry = ncfLexicon.getLexiconEntry(output[2]);
+		if (myEntry != null) {
+			String[] poses = myEntry.getCategories();
+			for (String s: poses)
+			{
+				String[] wcs = nupos.getMajorWordClass(s).split("/");
+				for (String wc: wcs)
+				{
+					if (wc.equalsIgnoreCase(args[1]))
+					{
+						return output;
+					}
+				}
+			}
+			return null;
 		} else
 		{
 			return null;
 		}
-	}
-
-	public String adornEmeFile(String infilename)
-		throws Exception
-	{
-		String[] output = new String[5];
-		String[] outnameparts = new String[2];
-		outnameparts[0] = infilename.split("-")[0];
-		outnameparts[1] = "output.txt";
-		outfilename = String.join("-",outnameparts);
-		PrintWriter writer = new PrintWriter(outfilename,"UTF-8");
-		BufferedReader reader = new BufferedReader(new FileReader(infilename));
-		String line;
-		while ((line = reader.readLine()) != null)
-		{
-			try
-			{
-				output = emeLemmatise(line.split("\t"));
-				if (output != null) 
-				{
-					writer.println(String.join("\t", output));
-				}
-			} catch(Exception e)
-			{
-				continue;
-			}
-		}
-		writer.close();
-		return outfilename;
-	}
-
-	public String adornEceFile(String infilename)
-		throws Exception
-	{
-		String[] output = new String[5];
-		String[] outnameparts = new String[2];
-		outnameparts[0] = infilename.split("-")[0];
-		outnameparts[1] = "output.txt";
-		outfilename = String.join("-",outnameparts);
-		PrintWriter writer = new PrintWriter(outfilename,"UTF-8");
-		BufferedReader reader = new BufferedReader(new FileReader(infilename));
-		String line;
-		while ((line = reader.readLine()) != null)
-		{
-			try
-			{
-				output = eceLemmatise(line.split("\t"));
-				if (output != null) 
-				{
-					writer.println(String.join("\t", output));
-				}
-			} catch(Exception e)
-			{
-				continue;
-			}
-		}
-		writer.close();
-		return outfilename;
-	}
-
-	public String adornNcfFile(String infilename)
-		throws Exception
-	{
-		String[] output = new String[5];
-		String[] outnameparts = new String[2];
-		outnameparts[0] = infilename.split("-")[0];
-		outnameparts[1] = "output.txt";
-		outfilename = String.join("-",outnameparts);
-		PrintWriter writer = new PrintWriter(outfilename,"UTF-8");
-		BufferedReader reader = new BufferedReader(new FileReader(infilename));
-		String line;
-		while ((line = reader.readLine()) != null)
-		{
-			try
-			{
-				output = ncfLemmatise(line.split("\t"));
-				if (output != null) 
-				{
-					writer.println(String.join("\t", output));
-				}
-			} catch(Exception e)
-			{
-				continue;
-			}
-		}
-		writer.close();
-		return outfilename;
 	}
 }

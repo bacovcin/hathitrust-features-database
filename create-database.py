@@ -1,5 +1,6 @@
-from py4j.java_gateway import JavaGateway
 import glob
+from time import perf_counter as perfc
+from bson.objectid import ObjectId
 from itertools import islice
 import os
 import multiprocessing as mp
@@ -38,15 +39,11 @@ def create_pos_dict():
     return posdict
 
 def worker_init(queue, debug):
-     # Opoen the MongoDB database
+     # Open the MongoDB database
     dbclient = pymongo.MongoClient()
     db = dbclient.hathitrust
 
-    # Create lemmatiser connection
-    gateway = JavaGateway()
-    lemmatiser = gateway.entry_point.getLemmatiser()
-
-    # Initialize teh POS dictionary
+    # Initialize the POS dictionary
     posdict = create_pos_dict()
 
     print('Worker ' + str(os.getpid()) + ' has been initialized.')
@@ -55,10 +52,9 @@ def worker_init(queue, debug):
         # Wait until there is an volume in the queue to be processed
         volname = queue.get(True)
 
-        # Output stuff
-        print('Worker ' + str(os.getpid()) + ' has loaded ' + volname)
-
         if debug:
+            # Output stuff
+            print('Worker ' + str(os.getpid()) + ' has loaded ' + volname)
             print('Worker ' + str(os.getpid()) + ' has queue size of ' + 
                   str(queue.qsize()))
 
@@ -81,78 +77,69 @@ def worker_init(queue, debug):
             else:
                 corpus = 'ncf' # Nineteenth Century Fiction
 
-            # Extract all the words in the body of the text
-            dLbody = [(y,
-                       x['body']['tokenPosCount'][y],
-                      int( x['seq']))
-                      for x in volfile['features']['pages']
-                      for y in x['body']['tokenPosCount']
-                     ]
+            # Create list of documents
+            documents = [{'form': y,
+                          'count': x['body']['tokenPosCount'][y][z],
+                          'POS':z,
+                          'volumeIdentifier':volID,
+                          'pageNum':x['seq'],
+                         }
+                         for x in volfile['features']['pages']
+                         for y in x['body']['tokenPosCount']
+                         for z in x['body']['tokenPosCount'][y]
+                        ]
 
-            # Open file for transfer of data to MorphAdorner
-            outfilename = str(os.getpid())+'-input.csv'
-            outfile = open(outfilename,'w')
+            # Initialize list of requests for later bulk insertion
+            tokensRequests = []
+            lemmataRequests = []
 
-            # Preprocess each word and put it in the database
-            for word in dLbody:
-                for key in word[1]:
-                    try:
-                        # Convert Hathitrust POS into format for MorphAdorner
-                        if key != '$':
-                            pos = key.lstrip('$')
-                        else:
-                            pos = key
-                        # Get the word class of the word
-                        wc = posdict[pos]
+            for i in range(len(documents)):
+                # Get each document
+                doc = documents[i]
 
-                        outfile.write(word[0]+'\t'+
-                                      wc[1]+'\t'+
-                                      wc[2]+'\t'+
-                                      key+'~='+str(word[1][key])+'\t'+
-                                      str(word[2])+'\n')
-                    except KeyError:
-                        continue
+                # Strip leading characters from POS tags
+                if doc['POS'] != '$':
+                    doc['POS'] = doc['POS'].lstrip('$')
 
-            # Send request to MorphAdorner to lemmatise file
-            if corpus == 'eme':
-                infilename = lemmatiser.adornEmeFile(outfilename)
-            elif corpus == 'ece':
-                infilename = lemmatiser.adornEceFile(outfilename)
-            elif corpus == 'ncf':
-                infilename = lemmatiser.adornNcfFile(outfilename)
-
-            # Open results to send to MongoDB
-            infile = open(infilename)
-
-            # Read through MorphAdorner output and 
-            # create the documents for MongoDB
-            documents = []
-            for line in infile:
-                s = line.rstrip().split('\t')
                 try:
-                    poss = s[3].split('~=')
-                    documents.append({
-                                     'form':s[0],
-                                     'standardSpelling':s[1],
-                                     'lemma':s[2],
-                                     'POS':poss[0],
-                                     'count':int(poss[1]),
-                                     'volumeIdentifier':volID,
-                                     'pageNum':s[4]
-                                    })
-                except IndexError:
-                    # Something has gone wrong and there is an line with the 
-                    # wrong format (save the line to the error file and
-                    # continue)
-                    with open('errorline.txt','a') as errorfile:
-                        errorfile.write(line)
-                    continue
+                    # Lookup MorphAdorner wordclasses
+                    wc = posdict[doc['POS']]
 
+                    # Save wordclasses in the documents lemmaKey
+                    doc['lemmaKey'] = doc['form']+':::'+wc[1]+':::'+wc[0]+':::'+corpus
+
+                    # Add the document as a request to the list
+                    # of tokens requests
+                    tokensRequests.append(pymongo.InsertOne(doc))
+
+                    # Add the lemmaKey as a document for lemmata
+                    lemmataRequests.append(pymongo.UpdateOne(filter={'_id':doc['lemmaKey']},
+                                                             update={'$set':{'_id':doc['lemmaKey']}},
+                                                             upsert=True))
+                except KeyError:
+                    if debug:
+                        with open('errorlist.txt','a') as errorfile:
+                            errorfile.write(str(doc)+'\n')
+                    continue
             # Bulk insert documents into mongodb
-            db.tokens.insert_many(documents,
-                                  ordered=False,
-                                  bypass_document_validation=True
-                                 )
+            startt = perfc()
+            db.tokens.bulk_write(tokensRequests,
+                                 ordered=False)
+            with open('timings.csv','a') as outfile:
+                outfile.write(str(os.getpid())+','+
+                              str(perfc() - startt)+','+
+                              str(len(tokensRequests))+','+
+                              'tokens\n')
+
+            startt = perfc()
+            db.lemmata.bulk_write(lemmataRequests,
+                                  ordered=False)
+            with open('timings.csv','a') as outfile:
+                outfile.write(str(os.getpid())+','+
+                              str(perfc() - startt)+','+
+                              str(len(lemmataRequests))+','+
+                              'lemmata\n')
+
         os.remove(volname)
         queue.task_done()
 
@@ -163,13 +150,14 @@ def main():
 
         # Reinitialize the collections to be rebuilt
         db.tokens.drop()
+        db.lemmata.drop()
         db.metadata.drop()
 
     # Set defaults for flags
-    tmps = 1
-    downsize = 1
+    tmps = 200
+    downsize = 1000
     debug=False
-    poolsize=1
+    poolsize=5
 
     # Set flags if passed as arguments
     for x in sys.argv:
@@ -200,7 +188,7 @@ def main():
     mypool = mp.Pool(poolsize, worker_init,(document_queue,debug,))
 
     # Make sure that the file list is up to date
-    os.system("rsync -az " +
+    os.system("rsync -azv " +
               "data.analytics.hathitrust.org::features/listing/htrc-ef-all-files.txt" +
               " .")
 
@@ -233,6 +221,7 @@ def main():
             os.system("rsync -av --no-relative --files-from sample.txt " +
                       "data.analytics.hathitrust.org::features/ . >/dev/null 2>&1")
 
+
         # Wait until all of the documents have been processed
         document_queue.join()
 
@@ -244,14 +233,10 @@ def main():
             document_queue.put(f)
 
     document_queue.join()
-    # After all documents have been added create indeices for database
-    db.tokens.create_index([('lemma',pymongo.ASCENDING),
-                            ('POS',pymongo.ASCENDING)])
+    # After all documents have been added create indices for database
+    print("Indexing...")
     db.metadata.create_index('volumeIdentifier')
-
-    # Deleted temporary files used to interface with MorphAdorner
-    os.remove(glob.glob("*input.csv"))
-    os.remove(glob.glob("*output.txt"))
+    db.tokens.create_index('lemmaKey')
 
 if __name__ == "__main__":
     main()
