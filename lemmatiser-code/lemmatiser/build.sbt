@@ -11,7 +11,9 @@ lazy val root = (project in file(".")).
     libraryDependencies += scalaTest % Test
   )
 
-libraryDependencies += "org.mongodb.scala" %% "mongo-scala-driver" % "2.1.0"
+libraryDependencies += "mysql" % "mysql-connector-java" % "5.1.24"
+libraryDependencies += "com.typesafe.akka" % "akka-actor" % "2.0.1"
+
 compileOrder := CompileOrder.JavaThenScala
 unmanagedClasspath in Compile += baseDirectory.value / "src" / "main" / "morphadorner-src"
 unmanagedClasspath in Runtime += baseDirectory.value / "src" / "main" / "morphadorner-src"

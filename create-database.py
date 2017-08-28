@@ -1,4 +1,6 @@
 import glob
+from _mysql_exceptions import *
+from string import Template
 from time import perf_counter as perfc
 from bson.objectid import ObjectId
 from itertools import islice
@@ -7,7 +9,7 @@ import multiprocessing as mp
 import sys
 import ujson
 import bz2
-import pymongo
+import MySQLdb as mariadb
 
 def create_pos_dict():
     # Load in a list of Penn Treebank POS tags and create a dictionary
@@ -38,13 +40,68 @@ def create_pos_dict():
             wc = ''
     return posdict
 
-def worker_init(queue, debug):
-     # Open the MongoDB database
-    dbclient = pymongo.MongoClient()
-    db = dbclient.hathitrust
+def lemma_worker(queue, debug, batchSize):
+    # Open the MariaDB database
+    db = mariadb.connect(user='hathitrust',
+                         password='plotkin', 
+                         database='hathitrust')
+
+    lemmaKeySet = set()
+
+    lemmatains = """INSERT INTO lemmata (lemmaKey)
+                             VALUES
+                        """
+    lemmainstemp = Template("('$lemmaKey')")
+
+    batchcount = 0
+
+    print('Lemma Worker ' + str(os.getpid()) + ' has been initialized.')
+
+    while True:
+        # Get the next lemma key
+        lemmaKey = queue.get(True)
+
+        if lemmaKey in lemmaKeySet:
+            # Already added to database
+            queue.task_done()
+        else:
+            # Insert lemmaKey into set
+            lemmaKeySet.add(lemmaKey)
+            # Add new command
+            db.query(lemmatains + lemmainstemp.substitute(lemmaKey =
+                                                          lemmaKey))
+            # Increase batchcount
+            batchcount += 1
+            # Run batch iff batchcount is high enough
+
+            if (batchcount == batchSize):
+                if debug:
+                    print('Lemma Worker ' + str(os.getpid()) + ' has sent a batch.')
+                db.commit()
+            queue.task_done()
+
+def worker_init(queue, lemmaqueue, debug):
+    # Open the MariaDB database
+    db = mariadb.connect(user='hathitrust',
+                         password='plotkin', 
+                         database='hathitrust')
 
     # Initialize the POS dictionary
     posdict = create_pos_dict()
+
+    # Initialize list of requests for later bulk insertion
+    tokensins = """INSERT INTO tokens
+                             (form,
+                              count,
+                              POS,
+                              volumeId,
+                              pageNum,
+                              lemmaKey)
+                             VALUES
+                        """
+
+    # Create the format strings for creating insert queries
+    tokeninstemp = Template("('$form',$count,'$POS','$volumeIdentifier',$pageNum,'$lemmaKey'),")
 
     print('Worker ' + str(os.getpid()) + ' has been initialized.')
 
@@ -60,14 +117,29 @@ def worker_init(queue, debug):
 
         # Load the volume
         volfile = ujson.loads(bz2.open(volname).readline())
+        curmeta = volfile['metadata']
 
-        if volfile['metadata']['language'] == 'eng':
+        if curmeta['language'] == 'eng':
             # Extract volume level characteristics
-            volID = volfile['metadata']['volumeIdentifier']
-            year = int(volfile['metadata']['pubDate'])
+            volID = curmeta['volumeIdentifier']
+            year = int(curmeta['pubDate'])
 
             # Add metadata to metadata collection
-            db.metadata.insert_one(volfile['metadata'])
+            metadatains = """INSERT INTO metadata
+                             (volumeId,title,pubDate,pubPlace,imprint,genre,names)
+                             VALUES
+                              ("""
+            metadatains += str("'"+volID.replace("'","''")+
+                               "','"+curmeta['title'].replace("'","''")+
+                               "',"+str(year)+
+                               ",'"+curmeta['pubPlace']+
+                               "','"+curmeta['imprint'].replace("'","''")+
+                               "',('"+','.join(curmeta['genre'])+
+                               "'),'"+
+                               ';'.join(curmeta['names']).replace("'","''")+
+                               "')"
+                            )
+            db.query(metadatains)
 
             # Determine what MorphAdorner corpus the volume falls in
             if year < 1700:
@@ -78,24 +150,26 @@ def worker_init(queue, debug):
                 corpus = 'ncf' # Nineteenth Century Fiction
 
             # Create list of documents
-            documents = [{'form': y,
-                          'count': x['body']['tokenPosCount'][y][z],
-                          'POS':z,
+            documents = [{'form': y.replace("'","''"),
+                          'count': str(x['body']['tokenPosCount'][y][z]),
+                          'POS':z.replace("'","''"),
                           'volumeIdentifier':volID,
-                          'pageNum':x['seq'],
+                          'pageNum':str(int(x['seq'])),
                          }
                          for x in volfile['features']['pages']
                          for y in x['body']['tokenPosCount']
                          for z in x['body']['tokenPosCount'][y]
                         ]
 
-            # Initialize list of requests for later bulk insertion
-            tokensRequests = []
-            lemmataRequests = []
+            tokeninserts = []
 
             for i in range(len(documents)):
                 # Get each document
                 doc = documents[i]
+
+                # Backslashes cause problems, so skip them
+                if "\\" in doc['form']:
+                    continue
 
                 # Strip leading characters from POS tags
                 if doc['POS'] != '$':
@@ -107,57 +181,99 @@ def worker_init(queue, debug):
 
                     # Save wordclasses in the documents lemmaKey
                     doc['lemmaKey'] = doc['form']+':::'+wc[1]+':::'+wc[0]+':::'+corpus
+                    lemmaqueue.put(doc['lemmaKey'])
 
                     # Add the document as a request to the list
                     # of tokens requests
-                    tokensRequests.append(pymongo.InsertOne(doc))
-
-                    # Add the lemmaKey as a document for lemmata
-                    lemmataRequests.append(pymongo.UpdateOne(filter={'_id':doc['lemmaKey']},
-                                                             update={'$set':{'_id':doc['lemmaKey']}},
-                                                             upsert=True))
+                    tokeninserts.append(tokeninstemp.substitute(doc))
                 except KeyError:
                     if debug:
                         with open('errorlist.txt','a') as errorfile:
                             errorfile.write(str(doc)+'\n')
                     continue
-            # Bulk insert documents into mongodb
-            startt = perfc()
-            db.tokens.bulk_write(tokensRequests,
-                                 ordered=False)
-            with open('timings.csv','a') as outfile:
-                outfile.write(str(os.getpid())+','+
-                              str(perfc() - startt)+','+
-                              str(len(tokensRequests))+','+
-                              'tokens\n')
-
-            startt = perfc()
-            db.lemmata.bulk_write(lemmataRequests,
-                                  ordered=False)
-            with open('timings.csv','a') as outfile:
-                outfile.write(str(os.getpid())+','+
-                              str(perfc() - startt)+','+
-                              str(len(lemmataRequests))+','+
-                              'lemmata\n')
-
+            curinsert = ''
+            i = 0
+            for ins in tokeninserts:
+                if i == 99:
+                    db.query(tokensins+curinsert[:-1])
+                    curinsert = ''
+                    i = 0
+                curinsert += ins
+            else:
+                db.query(tokensins+curinsert[:-1])
+            db.commit()
         os.remove(volname)
         queue.task_done()
 
 def main():
     # Temporarily open the MongoDB database
-    with pymongo.MongoClient() as dbclient:
-        db = dbclient.hathitrust
+    try:
+        db = mariadb.connect(user='hathitrust',
+                             password='plotkin', 
+                             database='hathitrust')
+    except:
+        dbclient = mariadb.connect(user='hathitrust',
+                                   password='plotkin')
+        dbclient.query('CREATE DATABASE hathitrust')
+        dbclient.close()
+        db = mariadb.connect(user='hathitrust',
+                             password='plotkin', 
+                             database='hathitrust')
+    db.query('DROP TABLE IF EXISTS tokens')
+    db.query('DROP TABLE IF EXISTS lemmata')
+    db.query('DROP TABLE IF EXISTS metadata')
+    db.query('''CREATE TABLE tokens (
+                    form varchar(255) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL,
+                    count int NOT NULL,
+                    POS varchar(4) NOT NULL,
+                    volumeId varchar(255) NOT NULL,
+                    pageNum int NOT NULL,
+                    lemmaKey varchar(255) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL
+                )''')
+    db.query('''CREATE TABLE lemmata (
+                    id int NOT NULL UNIQUE AUTO_INCREMENT,
+                    lemmaKey varchar(100) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL,
+                    lemma varchar(255) CHARACTER SET utf8 COLLATE utf8_bin,
+                    standard varchar(255) CHARACTER SET utf8 COLLATE utf8_bin,
+                    PRIMARY KEY (id)
+                )''')
+    db.query("""CREATE TABLE metadata (
+                    id int NOT NULL UNIQUE AUTO_INCREMENT,
+                    volumeId varchar(100) NOT NULL,
+                    title varchar(255) NOT NULL,
+                    pubDate int NOT NULL,
+                    pubPlace varchar(3) NOT NULL,
+                    imprint varchar(255) NOT NULL,
+                    genre  set('not fiction',
+                               'legal case and case notes',
+                               'government publication',
+                               'novel',
+                               'drama',
+                               'bibliography',
+                               'poetry',
+                               'biography',
+                               'catalog',
+                               'fiction',
+                               'statistics',
+                               'dictionary',
+                               'essay',
+                               'index') NOT NULL,
+                    names varchar(255) NOT NULL,
+                    PRIMARY KEY (id)
+                )""")
 
-        # Reinitialize the collections to be rebuilt
-        db.tokens.drop()
-        db.lemmata.drop()
-        db.metadata.drop()
+    db.query("SET GLOBAL max_allowed_packet=1073741824")
+
+    db.commit()
+    db.close()
 
     # Set defaults for flags
     tmps = 200
     downsize = 1000
+    batchSize = 100
     debug=False
     poolsize=5
+    nofilelist=False
 
     # Set flags if passed as arguments
     for x in sys.argv:
@@ -173,6 +289,11 @@ def main():
                     tmps = int(s[1])
                 except ValueError:
                     raise("Your tmps value must be an integer.")
+            elif s[0] == 'batchSize':
+                try:
+                    batchSize = int(s[1])
+                except ValueError:
+                    raise("Your batchSize value must be an integer.")
             elif s[0] == 'poolsize':
                 try:
                     poolsize = int(s[1])
@@ -180,17 +301,28 @@ def main():
                     raise("Your poolsize value must be an integer.")
             elif s[0] == 'debug':
                 debug = True
+            elif s[0] == 'nofilelist':
+                nofilelist = True
         except:
             continue
 
     # Create the worker pool for document processing
     document_queue = mp.JoinableQueue()
-    mypool = mp.Pool(poolsize, worker_init,(document_queue,debug,))
+    lemmakey_queue = mp.JoinableQueue()
+    mylemmatracker = mp.Pool(1,
+                             lemma_worker, 
+                             (lemmakey_queue,
+                              debug,
+                              batchSize,))
+    mypool = mp.Pool(poolsize - 1, worker_init,(document_queue,
+                                                lemmakey_queue,
+                                                debug,))
 
-    # Make sure that the file list is up to date
-    os.system("rsync -azv " +
-              "data.analytics.hathitrust.org::features/listing/htrc-ef-all-files.txt" +
-              " .")
+    if not nofilelist:
+        # Make sure that the file list is up to date
+        os.system("rsync -azv " +
+                  "data.analytics.hathitrust.org::features/listing/htrc-ef-all-files.txt" +
+                  " .")
 
     # Reset downsize to be number of volumes if downsize = -1
     vols = open('htrc-ef-all-files.txt')
@@ -233,10 +365,18 @@ def main():
             document_queue.put(f)
 
     document_queue.join()
+    lemmakey_queue.join()
     # After all documents have been added create indices for database
-    print("Indexing...")
-    db.metadata.create_index('volumeIdentifier')
-    db.tokens.create_index('lemmaKey')
+    db = mariadb.connect(user='hathitrust',
+                         password='plotkin', 
+                         database='hathitrust')
+    db.commit()
+    print("Requiring metadata to have unique volumeId...")
+    db.query("ALTER TABLE metadata ADD UNIQUE metadata(volumeId)")
+    print("Indexing lemmaKey in tokens for future work...")
+    db.query('CREATE INDEX lemmaKey ON tokens(lemmaKey)')
+    db.commit()
+    db.close()
 
 if __name__ == "__main__":
     main()
