@@ -129,10 +129,10 @@ object Main extends App
         }
         def writeToDatabase(outputs: List[List[List[String]]]): Unit =
         {
-          println("A new batch is being written")
+          println(self.path.name+" is starting a new batch...")
           val updateString: String = "UPDATE lemmata SET lemma = ?, standard = ? WHERE id = ?"
           val deleteTokensString: String = "DELETE FROM tokens where lemmaKey = ?"
-          val deleteLemmataString: String = "DELETE FROM lemmata where lemmaKey = ?"
+          val deleteLemmataString: String = "DELETE FROM lemmata where id = ?"
         
           val updateStmt: PreparedStatement = db.prepareStatement(updateString)
           val deleteTokensStmt: PreparedStatement = db.prepareStatement(deleteTokensString)
@@ -155,7 +155,7 @@ object Main extends App
               {
                 deleteTokensStmt.setString(1,output(1)(1))
                 deleteTokensStmt.addBatch()
-                deleteLemmataStmt.setString(1,output(1)(1))
+                deleteLemmataStmt.setInt(1,output(0)(0).toInt)
                 deleteLemmataStmt.addBatch()
               }
               case _ =>
