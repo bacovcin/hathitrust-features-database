@@ -12,7 +12,7 @@ lazy val root = (project in file(".")).
   )
 
 libraryDependencies += "mysql" % "mysql-connector-java" % "5.1.24"
-libraryDependencies += "com.typesafe.akka" % "akka-actor" % "2.0.1"
+libraryDependencies += "com.typesafe.akka" % "akka-actor_2.12" % "2.5.4"
 
 compileOrder := CompileOrder.JavaThenScala
 unmanagedClasspath in Compile += baseDirectory.value / "src" / "main" / "morphadorner-src"

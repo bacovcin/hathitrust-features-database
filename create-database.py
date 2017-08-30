@@ -57,12 +57,17 @@ def lemma_worker(queue, debug, batchSize):
 
     print('Lemma Worker ' + str(os.getpid()) + ' has been initialized.')
 
+    if debug:
+        starttime = perfc()
     while True:
         # Get the next lemma key
         lemmaKey = queue.get(True)
 
         if lemmaKey in lemmaKeySet:
             # Already added to database
+            queue.task_done()
+        elif lemmaKey == 'COMMIT':
+            db.commit()
             queue.task_done()
         else:
             # Insert lemmaKey into set
@@ -76,7 +81,10 @@ def lemma_worker(queue, debug, batchSize):
 
             if (batchcount == batchSize):
                 if debug:
-                    print('Lemma Worker ' + str(os.getpid()) + ' has sent a batch.')
+                    with open('timefile.csv','a') as timefile:
+                        timefile.write(str(os.getpid())+',lemmabatch,'+str(starttime-perfc())+'\n')
+                    starttime = perfc()
+                batchcount = 0
                 db.commit()
             queue.task_done()
 
@@ -108,6 +116,8 @@ def worker_init(queue, lemmaqueue, debug):
     while True:
         # Wait until there is an volume in the queue to be processed
         volname = queue.get(True)
+        if debug:
+            starttime = perfc()
 
         if debug:
             # Output stuff
@@ -191,16 +201,28 @@ def worker_init(queue, lemmaqueue, debug):
                         with open('errorlist.txt','a') as errorfile:
                             errorfile.write(str(doc)+'\n')
                     continue
+            if debug:
+                with open('timefile.csv','a') as timefile:
+                    timefile.write(str(os.getpid())+',loadtokens,'+str(starttime-perfc())+'\n')
+                starttime = perfc()
             curinsert = ''
             i = 0
             for ins in tokeninserts:
                 if i == 99:
                     db.query(tokensins+curinsert[:-1])
+                    if debug:
+                        with open('timefile.csv','a') as timefile:
+                            timefile.write(str(os.getpid())+',tokensbatch,'+str(starttime-perfc())+'\n')
+                        starttime = perfc()
                     curinsert = ''
                     i = 0
                 curinsert += ins
             else:
                 db.query(tokensins+curinsert[:-1])
+                if debug:
+                    with open('timefile.csv','a') as timefile:
+                        timefile.write(str(os.getpid())+',tokensbatch,'+str(starttime-perfc())+'\n')
+                    starttime = perfc()
             db.commit()
         os.remove(volname)
         queue.task_done()
@@ -222,6 +244,7 @@ def main():
     db.query('DROP TABLE IF EXISTS tokens')
     db.query('DROP TABLE IF EXISTS lemmata')
     db.query('DROP TABLE IF EXISTS metadata')
+    db.query('DROP TABLE IF EXISTS forms')
     db.query('''CREATE TABLE tokens (
                     form varchar(255) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL,
                     count int NOT NULL,
@@ -366,11 +389,13 @@ def main():
 
     document_queue.join()
     lemmakey_queue.join()
+    lemmakey_queue.put('COMMIT')
+    lemmakey_queue.join()
+    print('All data has been added...')
     # After all documents have been added create indices for database
     db = mariadb.connect(user='hathitrust',
                          password='plotkin', 
                          database='hathitrust')
-    db.commit()
     print("Requiring metadata to have unique volumeId...")
     db.query("ALTER TABLE metadata ADD UNIQUE metadata(volumeId)")
     print("Indexing lemmaKey in tokens for future work...")
