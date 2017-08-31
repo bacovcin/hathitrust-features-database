@@ -119,6 +119,7 @@ object Main extends App
             case "eme" => aLemmatizer.emeLemmatise(components)
             case "ece" => aLemmatizer.eceLemmatise(components)
             case "ncf" => aLemmatizer.ncfLemmatise(components)
+            case _ => null
           }
           output match
           {
