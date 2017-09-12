@@ -1,4 +1,0 @@
--Xms2G
--Xmx6G
--Xss2M
--XX:MaxMetaspaceSize=1024M
