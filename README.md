@@ -18,13 +18,15 @@ Before running the software make sure you unzip the morphadorner-2.0.1.zip in th
 ## Example query
 This query gets a list of all the past tense clauses by lemma, standardized spelling, place of publication and year of publication:
 ```
-SELECT lemmata.lemma lemma, lemmata.standard standard, metadata.pubDate year, metadata.pubPlace place, SUM(forms.count) count 
-	FROM (forms 
-			LEFT JOIN metadata ON forms.volumeID = metadata.id) 
-		LEFT JOIN lemmata 
-		ON forms.lemmaID = lemmata.id 
-		WHERE forms.POS = 'VBD'
-		GROUP BY lemmata.lemma, lemmata.standard, metadata.pubDate, metadata.pubPlace;
+SELECT lemmata.lemma lemma, lemmata.standard standard, 
+	   metadata.pubDate year, metadata.pubPlace place, 
+	   SUM(forms.count) count 
+	FROM (forms LEFT JOIN metadata ON forms.volumeID = metadata.id) 
+		  LEFT JOIN lemmata 
+		  ON forms.lemmaID = lemmata.id 
+		  WHERE forms.POS = 'VBD'
+		  GROUP BY lemmata.lemma, lemmata.standard, 
+		  		   metadata.pubDate, metadata.pubPlace;
 ```
 ## Structure of the output database
 Three output tables: forms, lemmata, metadata
