@@ -2,11 +2,12 @@
 This repository contains code to generate a MariaDB database out of the Hathitrust Extracted Features dataset. It also uses the MorphAdorner software to (1) identify OCR errors and exclude them from the database and (2) provide standardized spelling and lemmata for the remaining tokens.
 
 You will need to have the following software installed in order for this to work:
+```
 Java
 Scala
 sbt
 MariaDB
-
+```
 ## Instructions for use
 Before running the software make sure you unzip the morphadorner-2.0.1.zip in the morphadorner folder.
 
@@ -16,6 +17,7 @@ Before running the software make sure you unzip the morphadorner-2.0.1.zip in th
 
 ## Example query
 This query gets a list of all the past tense clauses by lemma, standardized spelling, place of publication and year of publication:
+```
 SELECT lemmata.lemma lemma, lemmata.standard standard, metadata.pubDate year, metadata.pubPlace place, SUM(forms.count) count 
 	FROM (forms 
 			LEFT JOIN metadata ON forms.volumeID = metadata.id) 
@@ -23,25 +25,28 @@ SELECT lemmata.lemma lemma, lemmata.standard standard, metadata.pubDate year, me
 		ON forms.lemmaID = lemmata.id 
 		WHERE forms.POS = 'VBD'
 		GROUP BY lemmata.lemma, lemmata.standard, metadata.pubDate, metadata.pubPlace;
-
+```
 ## Structure of the output database
 Three output tables: forms, lemmata, metadata
 
 ### Forms Structure
+```
 form = string containing the raw text from the volume
 count = number of attestations on a page
 POS = Penn Treebank Part of Speech tag (INDEXED)
 pageNum = page number from volume
 volumeID = lookup key for the metadata table (INDEXED)
 lemmaID = lookup key for the lemmata table (INDEXED)
-
+```
 ### Lemmata structure
+```
 id = lookup key for connecting to forms table
 lemmaKey = raw text:::lemma part of speech:::general part of speech:::corpus
 lemma = the lemma from MorphAdorner
 standard = the standardized form from MorphAdorner
-
+```
 ### Metadata structure
+```
 id = lookup key for connecting to the forms table
 volumeId = Hathitrust volume identifier
 title = string containing the title of the volume
@@ -50,7 +55,7 @@ pubPlace = three character code indicating place where volume was published
 imprint = strint containing publication information
 genre = a set of genres associated with the volume
 names = list of names associated with the volume (authors/editors) separated by semicolons
-
+```
 ## Structure of scala code
 The Scala code uses the Akka Actors system to implement a multithreaded system for building the database. 
 
