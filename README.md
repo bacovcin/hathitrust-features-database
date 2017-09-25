@@ -13,7 +13,7 @@ Before running the software make sure you unzip the morphadorner-2.0.1.zip in th
 
 1) Download the hathitrust filelist: rsync -azv data.analytics.hathitrust.org::features/listing/htrc-ef-all-files.txt .
 
-2) Run the scala code to build the MariaDB, remove non-English data and OCR errors, and add in lemmata: sbt -J-d64-Xmx=8G run
+2) Run the scala code to build the MariaDB, remove non-English data and OCR errors, and add in lemmata: sbt run
 
 ## Example query
 This query gets a list of all the past tense clauses by lemma, standardized spelling, place of publication and year of publication:
