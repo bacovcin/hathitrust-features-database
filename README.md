@@ -90,14 +90,18 @@ The DBRouters receive insert queries from the other actors and store them to gen
 ### Work flow
 1) Load files in batches
 
-2) Process files using data workers
+2) Per batch:
 
-3) Process lemmata using lemma workers
+2a) Process files using data workers
 
-4) When all the files have been processed tell lemma workers to write out any remaining lemmata
+2b) Process lemmata using lemma workers
 
-5) After all lemmata have been written, normalize the database by creating the form table by (i) removing all forms that don't have a corresponding row in the lemmata table and (ii) inserting the proper integer lookup keys rather than string lookup keys
+2c) When all the files have been processed tell lemma workers to write out any remaining lemmata
 
-6) Index the relevant columns in the forms table
+2d) Once all the lemmata are done, tell all the DBRouters to send remaining queries to the database
+
+3) After all batches have been processed, normalize the database by creating the form table by (i) removing all forms that don't have a corresponding row in the lemmata table and (ii) inserting the proper integer lookup keys rather than string lookup keys
+
+4) Index the relevant columns in the forms table
 
 
