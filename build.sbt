@@ -19,3 +19,6 @@ libraryDependencies += "org.apache.commons" % "commons-compress" % "1.5"
 compileOrder := CompileOrder.JavaThenScala
 unmanagedClasspath in Compile += baseDirectory.value / "src" / "main" / "morphadorner-src"
 unmanagedClasspath in Runtime += baseDirectory.value / "src" / "main" / "morphadorner-src"
+
+fork := true
+javaOptions in run += "-d64-Xmx12G-XX:-UseGCOverheadLimit"

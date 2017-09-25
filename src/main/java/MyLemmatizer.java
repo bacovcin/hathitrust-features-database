@@ -172,7 +172,6 @@ public class MyLemmatizer {
 
 		System.out.println("NCF Lemmatizer initialised...");
 
-
 		return;
 	}
 
@@ -274,6 +273,7 @@ public class MyLemmatizer {
 	{
 		String[] output = new String[3];
 		output[0] = args[0];
+
 
 		output[1] = 
 			ncfStandardizer.standardizeSpelling

@@ -8,7 +8,7 @@ import scala.io._
 import sys.process._
 
 // Import mutable sets for tracking unique lemmakeys
-import scala.collection.mutable.Set
+import scala.collection.mutable.{Set => Set,Map => MMap}
 
 // Import Try code to capture exceptions
 import scala.util.{Try, Success, Failure}
@@ -29,17 +29,17 @@ import lemmatizer.MyLemmatizer
 object Main extends App
 {
   // Database information
-  val url = "jdbc:mysql://localhost/hathitrust"
+  val url = "jdbc:mysql://localhost/hathitrust?rewriteBatchedStatements=true"
   val username = "hathitrust"
   val password = "hathitrust"
 
   // Batch size for database queries
-  val dataBatchSize = 2
-  val lemmaBatchSize = 1000
+  val dataBatchSize = 20
+  val lemmaBatchSize = 2500
 
   // Number of workers
   val numDataWorkers = 2 // Workers who read in files and insert data
-  val numLemmaWorkers = 2 // Workers who perform lemmatization
+  val numLemmaWorkers = 4 // Workers who perform lemmatization
 
 
   // Messages for the Akka workers to send to one another
@@ -49,12 +49,17 @@ object Main extends App
   case class Initialize(batchSize: Int) extends AkkaMessage
   case class Lemmatise(lemmaKeys: List[String]) extends AkkaMessage 
   case class LemmaKey(lemmaKey: String) extends AkkaMessage
+  case class LemmaKeys(lemmaKeys: Set[String]) extends AkkaMessage
   case class Process(filename: String) extends AkkaMessage 
+  case class Download(filenames: List[String]) extends AkkaMessage 
+  case class WriteToDB(queryString: String, queries: List[List[Any]], types: List[String]) extends AkkaMessage
+  case class LogMessage(processname: String,workerid:String, action: String, timestamp: String) extends AkkaMessage
   case object NeedWork extends AkkaMessage
   case object Close extends AkkaMessage
   case object LemmaDone extends AkkaMessage
   case object DataDone extends AkkaMessage
   case object Finished extends AkkaMessage
+  case object DBFinished extends AkkaMessage
 
   /** Main code for the programme */
   def main() : Unit = 
@@ -67,6 +72,57 @@ object Main extends App
                    lemmaBatchSize,
                    numDataWorkers,
                    numLemmaWorkers)
+  }
+  
+  /** Rsync all of the files in a filelist*/
+  def downloadNewBatch(batch: List[String]) : Unit =
+  {
+    val timestamp = System.currentTimeMillis().toString
+    val samplename = "sample"+timestamp+".txt"
+    val samplefile = new PrintWriter(new File(samplename))
+    for (file <- batch)
+    {
+      samplefile.write(file+'\n') 
+    }
+    samplefile.close
+    val syncstring = "rsync -av --no-relative --files-from "+samplename+" data.analytics.hathitrust.org::features/ ."
+    syncstring.!
+        
+    val rmstring = "rm "+samplename 
+    rmstring.!
+  }
+
+  /** Downloads a batch of files from the Hathitrust server */
+  class Downloader extends Actor
+  {
+    /** Perform task for each message */
+    def receive = 
+    {
+      case Download(filenames) =>
+      {
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","downloadStart",System.currentTimeMillis().toString)
+        downloadNewBatch(filenames)
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","downloadFinish",System.currentTimeMillis().toString)
+      }
+    }
+  }
+  /** Writes out a log code to a log file */
+  class Logger extends Actor
+  {
+    val logfile = new PrintWriter(new File("log.csv"))
+    logfile.write("processname,workerid,action,timestamp\n")
+    /** Perform task for each message */
+    def receive = 
+    {
+      case LogMessage(processname: String,workerid: String, action: String, timestamp: String) =>
+      {
+        logfile.write(processname+","+workerid+","+action+","+timestamp+"\n")
+      }
+      case Finished =>
+      {
+        logfile.close
+      }
+    }
   }
 
   /** Downloads files and distributes them to data workers  
@@ -81,9 +137,152 @@ object Main extends App
     var curbatch: List[String] = List[String]()
     var nextbatch: List[String] = List[String]()
     var dataworkers: List[Object] = List[Object]()
+    var numWorkers: Int = 0
     val lemmadispatcher = context.system.actorOf(Props[LemmaDispatcher],name="LemmaDispatcher")
+    val downloader = context.system.actorOf(Props[Downloader],name="Downloader")
+    val dbroutermeta = context.system.actorOf(Props[DBRouterWorker],name="DBMetarouter")
+    val dbrouterlemma = context.system.actorOf(Props[DBRouterWorker],name="DBLemmarouter")
+    val dbrouterdata = context.system.actorOf(Props[DBRouterWorker],name="DBDatarouter")
+    val logger = context.system.actorOf(Props[Logger],name="Logger")
     var finishedWorkers: Int = 0
+    var dbfinished = 0
     var notLastBatch: Boolean = true
+
+    /** Open a db connection, run code, and then close the connection */
+    def workOnDatabase[A](url:String, username:String, password:String, workCode: Connection => A) : A = 
+    {
+      val driver = "com.mysql.jdbc.Driver"
+      val connection: Connection = DriverManager.getConnection(url, username, password)
+      val output = workCode(connection)
+      connection.close()
+      output
+    }
+
+    /** Normalise the database*/
+    def normalizeCorpus()(db: Connection): Unit =
+    {
+      println("Dropping the forms table...")
+      context.actorSelection("/user/Logger") ! LogMessage("normalizer","0","dropforms",System.currentTimeMillis().toString)
+      val dropTableStmt1: Statement = db.createStatement()
+      dropTableStmt1.executeUpdate("DROP TABLE IF EXISTS forms")
+
+      println("Adding the LemmaKey index on lemmata...")
+      context.actorSelection("/user/Logger") ! LogMessage("indexing","0","addlemmakeyindex",System.currentTimeMillis().toString)
+      val lemmakeyIndexStmt: Statement = db.createStatement()
+      lemmakeyIndexStmt.executeUpdate("CREATE INDEX lemmaKey on lemmata(lemmaKey)")
+
+      println("Adding the POS index on forms...")
+      context.actorSelection("/user/Logger") ! LogMessage("indexing","0","addvolidindex",System.currentTimeMillis().toString)
+      val volidIndexStmt: Statement = db.createStatement()
+      volidIndexStmt.executeUpdate("CREATE INDEX volumeId on metadata(volumeId)")
+
+      println("Recreating the forms table from tokens...")
+      context.actorSelection("/user/Logger") ! LogMessage("normalizer","0","creatforms",System.currentTimeMillis().toString)
+      val createTableStmt: Statement = db.createStatement()
+      createTableStmt.executeUpdate("CREATE TABLE forms SELECT tokens.form form, tokens.count count, tokens.POS POS, tokens.pageNum pageNum, metadata.id volumeID, lemmata.id lemmaID FROM tokens INNER JOIN metadata ON tokens.volumeId = metadata.volumeId INNER JOIN lemmata ON tokens.lemmaKey = lemmata.lemmaKey;")
+
+      println("Dropping now redundant tokens table...")
+      context.actorSelection("/user/Logger") ! LogMessage("normalizer","0","droptokens",System.currentTimeMillis().toString)
+      val dropTableStmt2: Statement = db.createStatement()
+      dropTableStmt2.executeUpdate("DROP TABLE IF EXISTS tokens")
+
+      println("Dropping the LemmaKey index on lemmata...")
+      context.actorSelection("/user/Logger") ! LogMessage("indexing","0","rmlemmakeyindex",System.currentTimeMillis().toString)
+      val lemmakeyDeindexStmt: Statement = db.createStatement()
+      lemmakeyDeindexStmt.executeUpdate("ALTER TABLE lemmata DROP INDEX lemmaKey")
+
+      println("Dropping the volumeId index on metadata...")
+      context.actorSelection("/user/Logger") ! LogMessage("indexing","0","rmvolidindex",System.currentTimeMillis().toString)
+      val volidDeindexStmt: Statement = db.createStatement()
+      volidDeindexStmt.executeUpdate("ALTER TABLE metadata DROP INDEX volumeId")
+
+      context.actorSelection("/user/Logger") ! LogMessage("normalizer","0","donenormalizing",System.currentTimeMillis().toString)
+
+    }
+
+    /** Index the database*/
+    def indexCorpus()(db: Connection): Unit =
+    {
+      println("Adding the POS index on forms...")
+      context.actorSelection("/user/Logger") ! LogMessage("indexing","0","addposindex",System.currentTimeMillis().toString)
+      val posIndexStmt: Statement = db.createStatement()
+      posIndexStmt.executeUpdate("CREATE INDEX POS on forms(POS)")
+
+      println("Adding the lemmaId index on forms...")
+      context.actorSelection("/user/Logger") ! LogMessage("indexing","0","addlemmaindex",System.currentTimeMillis().toString)
+      val lemmaIndexStmt: Statement = db.createStatement()
+      lemmaIndexStmt.executeUpdate("CREATE INDEX lemmaID on forms(lemmaID)")
+
+      println("Adding the volumeID index on forms...")
+      val volIndexStmt: Statement = db.createStatement()
+      context.actorSelection("/user/Logger") ! LogMessage("indexing","0","addvolindex",System.currentTimeMillis().toString)
+      volIndexStmt.executeUpdate("CREATE INDEX volumeID on forms(volumeID)")
+      context.actorSelection("/user/Logger") ! LogMessage("indexing","0","doneindexing",System.currentTimeMillis().toString)
+    }
+    /** Initialize database 
+    *
+     *  Delete tables if they exist and create new tables
+    *  */
+    def initialiseDatabase()(db: Connection): Unit =
+    {
+      println("Deleting the tables...")
+      val dropTableStmt1: Statement = db.createStatement()
+      dropTableStmt1.executeUpdate("DROP TABLE IF EXISTS tokens")
+      val dropTableStmt2: Statement = db.createStatement()
+      dropTableStmt2.executeUpdate("DROP TABLE IF EXISTS lemmata")
+      val dropTableStmt3: Statement = db.createStatement()
+      dropTableStmt3.executeUpdate("DROP TABLE IF EXISTS metadata")
+      val dropTableStmt4: Statement = db.createStatement()
+      dropTableStmt4.executeUpdate("DROP TABLE IF EXISTS forms")
+
+      println("Initialising tables...")
+      val createTableStmt1: Statement = db.createStatement()
+      createTableStmt1.executeUpdate("""CREATE TABLE tokens (
+                     form varchar(100) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL,
+                      count int NOT NULL,
+                      POS varchar(4) NOT NULL,
+                      volumeId varchar(35) NOT NULL,
+                      pageNum int NOT NULL,
+                      lemmaKey varchar(255) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL
+                  )""")
+      val createTableStmt2: Statement = db.createStatement()
+      createTableStmt2.executeUpdate(""" CREATE TABLE lemmata (
+                      id int NOT NULL UNIQUE AUTO_INCREMENT,
+                      lemmaKey varchar(255) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL,
+                      lemma varchar(100) CHARACTER SET utf8 COLLATE utf8_bin,
+                      standard varchar(100) CHARACTER SET utf8 COLLATE utf8_bin,
+                      PRIMARY KEY (id)
+                  )""")
+      val createTableStmt3: Statement = db.createStatement()
+      createTableStmt3.executeUpdate("""CREATE TABLE metadata (
+                      id int NOT NULL UNIQUE AUTO_INCREMENT,
+                      volumeId varchar(35) NOT NULL,
+                      title varchar(1000) NOT NULL,
+                      pubDate int NOT NULL,
+                      pubPlace varchar(3) NOT NULL,
+                      imprint varchar(255) NOT NULL,
+                      genre  set('not fiction',
+                                'legal case and case notes',
+                                'government publication',
+                                'novel',
+                                'drama',
+                                'bibliography',
+                                'poetry',
+                                'biography',
+                                'catalog',
+                                'fiction',
+                                'statistics',
+                                'dictionary',
+                                'essay',
+                                'index') NOT NULL,
+                     names varchar(255) NOT NULL,
+                     PRIMARY KEY (id)
+                 )""")
+
+      val setStmt1: Statement = db.createStatement()
+      setStmt1.executeUpdate("SET GLOBAL max_allowed_packet=1073741824")
+
+    }
     /** Recursively populate the list of dataworkers with workers*/
     def createDataWorkers(numWorkers: Int, curWorkerNum: Int): Unit =
     {
@@ -111,8 +310,9 @@ object Main extends App
       val filelist = Source.fromFile("htrc-ef-all-files.txt")
       var newbatch = List[String]()
       val lines = filelist.getLines
-      for (line <- lines)
+      for (i <- 1 until 100)
       {
+        var line = lines.next
         newbatch = newbatch :+ line
         if (newbatch.length == dataBatchSize)
         {
@@ -121,13 +321,6 @@ object Main extends App
         }
       }
       filelist.close
-    }
-    /** Download the next batch and get the list of downloaded files */
-    def getListOfFiles(dir: File, extensions: List[String]): List[String] = {
-      val files = dir.listFiles.filter(_.isFile).toList.filter { file =>
-        extensions.exists(file.getName.endsWith(_))
-      }
-      for (x <- files) yield x.getName
     }
 
     // Download a batch (and the first time download the next batch as well)
@@ -138,11 +331,13 @@ object Main extends App
         case true =>
         {
           val head1::tail1 = this.databatches
+          // For the first download block until rsync is done
           downloadNewBatch(head1)
           this.curbatch = head1.map(_.split("/").last)
           this.databatches = tail1
           val head2::tail2 = this.databatches
-          downloadNewBatch(head2)
+          // Asyncroneously run the rsync now
+          context.actorSelection("/user/Downloader") ! Download(head2)
           this.nextbatch = head2.map(_.split("/").last)
           this.databatches = tail1
           this.databatches = tail2
@@ -154,30 +349,18 @@ object Main extends App
           {
             this.curbatch = this.nextbatch
             val head::tail = this.databatches
-            downloadNewBatch(head)
+            // Asyncroneously run the rsync now
+            context.actorSelection("/user/Downloader") ! Download(head)
             this.nextbatch = head.map(_.split("/").last)
             this.databatches = tail
             return true
           } else
           {
-            this.curbatch = getListOfFiles(new File("."),List("bz2"))
+            this.curbatch = this.nextbatch
             return false
           }
         }
       }
-    }
-
-    /** Rsync all of the files in a filelist*/
-    def downloadNewBatch(batch: List[String]) : Unit =
-    {
-      val samplefile = new PrintWriter(new File("sample.txt"))
-      for (file <- batch)
-      {
-        println(file)
-        samplefile.write(file+'\n') 
-      }
-      samplefile.close
-      "rsync -av --no-relative --files-from sample.txt data.analytics.hathitrust.org::features/ .".!
     }
 
     /** Perform task for each message */
@@ -188,22 +371,63 @@ object Main extends App
       case StartMain(dataBatchSize, lemmaBatchSize,
                  numDataWorkers, numLemmaWorkers) =>
       {
+        this.numWorkers = numDataWorkers
+        createLemmaDispatcher(numLemmaWorkers, lemmaBatchSize)
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","startedSystem",System.currentTimeMillis().toString)
         workOnDatabase(url,username,password,initialiseDatabase())
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","initialisedDatabase",System.currentTimeMillis().toString)
         //"rsync -azv data.analytics.hathitrust.org::features/listing/htrc-ef-all-files.txt .".!
         createBatches(dataBatchSize)
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","createdBatches",System.currentTimeMillis().toString)
         getNextBatch(true)
-        createLemmaDispatcher(numLemmaWorkers, lemmaBatchSize)
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","gotFirstBatch",System.currentTimeMillis().toString)
         createDataWorkers(numDataWorkers, 0)
       }
-      // Learn that all the work is done and do finishing touches on database and quit
+      // Learn that all the work has been sent to the database writers, wait for the database writing to be finished before normalizing and indexing
       case LemmaDone =>
       {
-        println("Starting normalizing...")
-        workOnDatabase(url,username,password,normalizeCorpus())
-        println("Starting indexing...")
-        workOnDatabase(url,username,password,indexCorpus())
-        println("Shutting down...")
-        context.system.terminate()
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","finishedLemmaBatch",System.currentTimeMillis().toString)
+        println("Lemmatization batch finished...")
+        this.dbroutermeta ! Finished
+        this.dbrouterdata ! Finished
+        this.dbrouterlemma ! Finished
+      }
+      // Learn that all the work is done and do finishing touches on database and quit
+      case DBFinished =>
+      {
+        this.dbfinished += 1
+        if (this.dbfinished == 3)
+        {
+          this.dbfinished = 0
+          context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","finishedDBBatch",System.currentTimeMillis().toString)
+          println("Database IO batch finished...")
+          if (this.notLastBatch)
+          {
+            this.notLastBatch = getNextBatch(false)
+            println("Starting a new batch...")
+            context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","gotNewBatch",System.currentTimeMillis().toString)
+            for (worker <- 1 until this.numWorkers+1)
+            {
+              var head::tail = this.curbatch
+              println(worker)
+              context.actorSelection("/user/DataWorker"+worker.toString) ! Process(head)
+              this.curbatch = tail
+            }
+          } else
+          {
+            for (worker <- 1 until this.numWorkers)
+            {
+              context.actorSelection("/user/DataWorker"+worker.toString) ! Close
+            }
+            println("Starting normalizing...")
+            workOnDatabase(url,username,password,normalizeCorpus())
+            println("Starting indexing...")
+            workOnDatabase(url,username,password,indexCorpus())
+            println("Shutting down...")
+            context.actorSelection("/user/Logger") ! Finished
+            context.system.terminate()
+          }
+        }
       }
       // Send the next file in the batch to the data actor
       case NeedWork =>
@@ -213,21 +437,116 @@ object Main extends App
           val head::tail = this.curbatch
           sender ! Process(head)
           this.curbatch = tail
-        } else if (this.notLastBatch == false)
-        {
-          sender ! Close
-          finishedWorkers += 1
-          if (finishedWorkers == dataworkers.length)
-          {
-            context.actorSelection("/user/LemmaDispatcher") ! DataDone
-          }
         } else
         {
-          this.notLastBatch = getNextBatch(false)
-          val head::tail = this.curbatch
-          sender ! Process(head)
-          this.curbatch = tail
+          context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","finishedDataBatch",System.currentTimeMillis().toString)
+          for (worker <- 1 until this.numWorkers)
+          this.finishedWorkers += 1
+          if (finishedWorkers == dataworkers.length)
+          {
+            println("Finished a batch...")
+            context.actorSelection("/user/LemmaDispatcher") ! DataDone
+            this.finishedWorkers = 0
+          }
         }
+      }
+    }
+  }
+
+  class DBRouterWorker extends Actor
+  {
+    val writeLength = 5000
+    val numDBWriters = 2
+    val myrouter = context.actorOf(RoundRobinPool(numDBWriters).props(Props[DBWriter]), self.path.name+"Router")
+    var finishedWorkers = 0
+    var outputList = List[List[Any]]()
+    var outputString = ""
+    var outputTypes = List[String]()
+    var outputCount = 0
+    def receive = 
+    {
+      case WriteToDB(queryString: String, queries: List[List[Any]],types: List[String]) =>
+      {
+        outputString = queryString
+        outputTypes = types
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","queryRecieved",System.currentTimeMillis().toString)
+        outputList = outputList :+ queries(0)
+        outputCount += queries.length
+        if (outputCount >= writeLength)
+        {
+          myrouter ! WriteToDB(queryString,outputList,types)
+          outputList = List[List[Any]]()
+          outputCount = 0
+        }
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","queryProcessed",System.currentTimeMillis().toString)
+      }
+      case Finished =>
+      {
+        myrouter ! WriteToDB(outputString,outputList,outputTypes)
+        myrouter ! Broadcast(Finished)
+      }
+      case DBFinished =>
+      {
+        this.finishedWorkers += 1
+        if (this.finishedWorkers == this.numDBWriters)
+        {
+          context.actorSelection("/user/MainDispatcher") ! DBFinished
+          this.finishedWorkers = 0
+        }
+      }
+    }
+  }
+
+  /** Writes out a log code to a log file */
+  class DBWriter extends Actor
+  {
+    val driver = "com.mysql.jdbc.Driver"
+    val db: Connection = DriverManager.getConnection(url, username, password)
+    def receive = 
+    {
+      case WriteToDB(queryString: String, queries: List[List[Any]],types: List[String]) =>
+      {
+        context.actorSelection("/user/Logger") ! LogMessage("DBWriter",self.path.name,"queryRecieved",System.currentTimeMillis().toString)
+        val queryStmt: PreparedStatement = db.prepareStatement(queryString)
+        var isFirst = true
+        for (query <- queries)
+        {
+          if (isFirst)
+          {
+            isFirst = false
+          } else
+          {
+            queryStmt.addBatch()
+          }
+          for (i <- 0 until types.length)
+          {
+            if (types(i) == "string")
+            {
+              queryStmt.setString(i+1,query(i).asInstanceOf[String])
+            } else if (types(i) == "int")
+            {
+              queryStmt.setInt(i+1,query(i).asInstanceOf[Int])
+            } else
+            {
+              println("You passed an illegal type: " + types(i))
+              context.system.terminate()
+            }
+          }
+        }
+        if (queries.length == 1)
+        {
+          queryStmt.executeUpdate()
+        } else
+        {
+          queryStmt.executeBatch()
+        }
+        queryStmt.close()
+        context.actorSelection("/user/Logger") ! LogMessage("DBWriter",self.path.name,"queryCompleted",System.currentTimeMillis().toString)
+      }
+      case Finished =>
+      {
+        context.actorSelection("/user/Logger") ! LogMessage("DBWriter",self.path.name,"shutdown",System.currentTimeMillis().toString)
+        sender ! DBFinished
       }
     }
   }
@@ -236,12 +555,10 @@ object Main extends App
    *  lemma dispatcher*/
   class DataWorker extends Actor
   {
-    val driver = "com.mysql.jdbc.Driver"
-    val db: Connection = DriverManager.getConnection(url, username, password)
-    var dataWriteSize = 1000
+    var uniqueCheckBatchSize = 100
     // A Map for converting POS tags into Morphadorner classes:
     val posdict: Map[String,List[String]] =
-      Map(
+      scala.collection.immutable.Map(
         ("\\u0027",List("none","punctuation","punctuation")),
         ("-",List("none","punctuation","punctuation")),
         ("\\u0022",List("none","punctuation","punctuation")),
@@ -302,8 +619,11 @@ object Main extends App
       // Get a file to process
       case Process(file) =>
       {
+        context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"processStart",System.currentTimeMillis().toString)
         val volstream = Source.fromInputStream(new BZip2CompressorInputStream(new BufferedInputStream(new FileInputStream(file)))).getLines.next
+        context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"openedFile",System.currentTimeMillis().toString)
         val volfile = parse(volstream).values.asInstanceOf[Map[Any,Any]]
+        context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"parsedFile",System.currentTimeMillis().toString)
         val curmeta = volfile("metadata").asInstanceOf[Map[Any,Any]]
         // Only use English data
         if (curmeta("language").asInstanceOf[String] == "eng")
@@ -312,15 +632,7 @@ object Main extends App
           val year = curmeta("pubDate").asInstanceOf[String].toInt
           // Deal with metadata
           val insertMetaString: String = "INSERT INTO metadata (volumeId,title,pubDate,pubPlace,imprint,genre,names) VALUES (?,?,?,?,?,(?),?)"
-          val insertMetaStmt: PreparedStatement = db.prepareStatement(insertMetaString)
-          insertMetaStmt.setString(1,volID)
-          insertMetaStmt.setString(2,curmeta("title").asInstanceOf[String].replace("'","''"))
-          insertMetaStmt.setInt(3,year)
-          insertMetaStmt.setString(4,curmeta("pubPlace").asInstanceOf[String])
-          insertMetaStmt.setString(5,curmeta("imprint").asInstanceOf[String].replace("'","''"))
-          insertMetaStmt.setString(6,curmeta("genre").asInstanceOf[List[String]].mkString(","))
-          insertMetaStmt.setString(7,curmeta("names").asInstanceOf[List[String]].mkString(";").replace("'","''"))
-          insertMetaStmt.executeUpdate()
+          context.actorSelection("/user/DBMetarouter") ! WriteToDB(insertMetaString,List[List[Any]](List[Any](volID,curmeta("title").asInstanceOf[String].replace("'","''"),year,curmeta("pubPlace").asInstanceOf[String],curmeta("imprint").asInstanceOf[String].replace("'","''"),curmeta("genre").asInstanceOf[List[String]].mkString(","),curmeta("names").asInstanceOf[List[String]].mkString(";").replace("'","''"))),List[String]("string","string","int","string","string","string","string"))
           var corpus = ""
           if (year < 1700)
           {
@@ -335,9 +647,11 @@ object Main extends App
 
           // Get tokens
           val insertTokenString: String = "INSERT INTO tokens (form,count,POS,volumeId,pageNum,lemmaKey) VALUES (?,?,?,?,?,?)"
-          var insertTokenStmt: PreparedStatement = db.prepareStatement(insertTokenString)
           var batchCount: Int = 0
           val pages = volfile("features").asInstanceOf[Map[Any,Any]]("pages").asInstanceOf[List[Map[Any,Any]]]
+          context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"getPages",System.currentTimeMillis().toString)
+          var curUniqueLemmaKeys: Set[String] = Set[String]()
+          var oldUniqueLemmaKeys: Set[String] = Set[String]()
           for (page <- pages)
           {
             var tokens = page("body").asInstanceOf[Map[Any,Any]]("tokenPosCount").asInstanceOf[Map[Any,Any]]
@@ -351,23 +665,19 @@ object Main extends App
                 {
                   var wc = posdict(newpos)
                   var lemmaKey = form.asInstanceOf[String].replace("'","''")+":::"+wc(1)+":::"+wc(0)+":::"+corpus
-                  insertTokenStmt.setString(1,form.asInstanceOf[String].replace("'","''"))
-                  insertTokenStmt.setInt(2,poses(pos).toInt)
-                  insertTokenStmt.setString(3,newpos.replace("'","''"))
-                  insertTokenStmt.setString(4,volID)
-                  insertTokenStmt.setInt(5,page("seq").asInstanceOf[String].toInt)
-                  insertTokenStmt.setString(6,lemmaKey)
-                  context.actorSelection("/user/LemmaDispatcher") ! LemmaKey(lemmaKey)
+                  if (!(oldUniqueLemmaKeys contains lemmaKey))
+                  {
+                    curUniqueLemmaKeys = curUniqueLemmaKeys + lemmaKey
+                  }
+                  var newToken = List[Any](form.asInstanceOf[String].replace("'","''"),poses(pos).toInt,newpos.replace("'","''"),volID,page("seq").asInstanceOf[String].toInt,lemmaKey)
+                  context.actorSelection("/user/DBDatarouter") ! WriteToDB(insertTokenString,List[List[Any]](newToken),List[String]("string","int","string","string","int","string"))
                   batchCount = batchCount + 1
-                  if (batchCount == dataWriteSize)
+                  if (batchCount == uniqueCheckBatchSize)
                   {
-                    insertTokenStmt.executeBatch()
-                    println(self.path.name + " has executed a batch...")
-                    insertTokenStmt = db.prepareStatement(insertTokenString)
+                    context.actorSelection("/user/LemmaDispatcher") ! LemmaKeys(curUniqueLemmaKeys)
+                    oldUniqueLemmaKeys = oldUniqueLemmaKeys union curUniqueLemmaKeys
+                    curUniqueLemmaKeys = Set[String]()
                     batchCount = 0
-                  } else
-                  {
-                    insertTokenStmt.addBatch()
                   }
                 } catch
                 {
@@ -376,12 +686,20 @@ object Main extends App
               }
             }
           }
-          insertTokenStmt.executeBatch()
-          println(self.path.name + " has executed a batch...")
+          context.actorSelection("/user/LemmaDispatcher") ! LemmaKeys(curUniqueLemmaKeys)
         }
+        context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"finishedWithFile",System.currentTimeMillis().toString)
+        println(self.path.name + " finished processing "+file+"...")
         sender ! NeedWork
-        val rmstring = "rm "+file
-        rmstring.!
+        val rmstring = "rm "+file 
+        rmstring.! 
+        context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"removedFile",System.currentTimeMillis().toString)
+      }
+      case Close =>
+      {
+        println(self.path.name + " has been asked to shutdown...")
+        context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"closed",System.currentTimeMillis().toString)
+        context.stop(self)
       }
     }
   }
@@ -398,7 +716,7 @@ object Main extends App
     var numWorkers = 0
     var batches: List[List[String]] = List[List[String]](List[String]())
     var finishedWorkers: Int = 0
-    var router = context.actorOf(SmallestMailboxPool(0).props(Props[LemmaWorker]), "dummyrouter")
+    var router = context.actorOf(RoundRobinPool(0).props(Props[LemmaWorker]), "dummyrouter")
 
     def receive = 
     {
@@ -406,22 +724,25 @@ object Main extends App
       case StartLemma(batchSize, numWorkers) =>
       {
         this.numWorkers = numWorkers
-        this.router = context.actorOf(SmallestMailboxPool(numWorkers).props(Props[LemmaWorker]), "router")
+        this.router = context.actorOf(RoundRobinPool(numWorkers).props(Props[LemmaWorker]), "router")
         this.router ! Broadcast(Initialize(batchSize))
       }
       // Send lemma keys on to the workers after checking for uniqueness
-      case LemmaKey(lemmaKey) =>
+      case LemmaKeys(lemmaKeys) =>
       {
-        if (!(uniqueLemmaKeys contains lemmaKey))
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","gotLemmaKeys",System.currentTimeMillis().toString)
+        val newLemmaKeys = lemmaKeys &~ uniqueLemmaKeys 
+        for (lemmaKey <- newLemmaKeys)
         {
-          uniqueLemmaKeys = uniqueLemmaKeys + lemmaKey
           this.router ! LemmaKey(lemmaKey)
+          uniqueLemmaKeys = uniqueLemmaKeys + lemmaKey
         }
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","finishedLemmaKeys",System.currentTimeMillis().toString)
       }
       // Tell the lemma workers to ignore batch size, since they won't get more data
       case DataDone =>
       {
-        this.router ! Broadcast(Close) 
+        this.router ! Broadcast(Finished) 
       }
       // Collect workers finishing to send final message back to the main dispatcher
       case LemmaDone =>
@@ -430,6 +751,7 @@ object Main extends App
         if (finishedWorkers == this.numWorkers)
         {
           context.actorSelection("/user/MainDispatcher") ! LemmaDone
+          finishedWorkers = 0
         }
       }
     }
@@ -438,43 +760,9 @@ object Main extends App
   /** Receives lemmakeys from LemmaDispatcher, performs lemmatisation,
    *  inserts new lemmadata in database*/
   class LemmaWorker extends Actor {
-    val driver = "com.mysql.jdbc.Driver"
-    val db: Connection = DriverManager.getConnection(url, username, password)
-    var lemmaCount: Int = 0
-    var lemmata: List[List[String]] = List[List[String]]()
-    var batchSize = 0
     var aLemmatizer = new MyLemmatizer()
+    val insertString: String = "INSERT lemmata (lemmaKey, lemma, standard) VALUES (?, ?, ?)"
 
-    def writeToDatabase(outputs: List[List[String]]): Unit =
-    {
-      val insertString: String = "INSERT lemmata (lemmaKey, lemma, standard) VALUES (?, ?, ?)"
-      val insertStmt: PreparedStatement = db.prepareStatement(insertString)
-
-      for (output <- outputs)
-      {
-        // If the lemmatizer gives a null result,
-        // that means that the form is either (a)
-        // not English or (b) an OCR error or
-        // (c) a really rare word (so no update)
-        //
-        // Otherwise we want to insert the lemmata data into the lemmata table
-        output(0) match
-        {
-          case null => {}
-          case _ =>
-          {
-            insertStmt.setString(1,output(3))
-            insertStmt.setString(2,output(2))
-            insertStmt.setString(3,output(1))
-            insertStmt.addBatch()
-          }
-        }
-      }
-      // Commit the batches to the database
-      val insertResults = insertStmt.executeBatch()
-      println(self.path.name + " has executed a batch...")
-    }
-      
     def processLemma(lemmaKey: String, aLemmatizer: MyLemmatizer): List[String] = 
     {
       // Break the lemmaKey into the form, major word class,
@@ -482,19 +770,19 @@ object Main extends App
       val components = lemmaKey.split(":::")
 
       // Use corpus appropriate lemmatizer
-      val output = components(3) match
+      val myoutput = components(3) match
       {
         case "eme" => aLemmatizer.emeLemmatise(components)
         case "ece" => aLemmatizer.eceLemmatise(components)
         case "ncf" => aLemmatizer.ncfLemmatise(components)
         case _ => null
       }
-      output match
+      myoutput match
       {
         case null => List[String](null)
         case _ => 
         {
-          output.toList :+ lemmaKey
+          myoutput.toList :+ lemmaKey
         }
       }
     }
@@ -504,134 +792,28 @@ object Main extends App
       case Initialize(batchSize: Int) =>
       {
         this.aLemmatizer.initialise()
-        this.batchSize = batchSize
       }
-      case Close =>
+      case Finished =>
       {
-        println(self.path.name+" has " + lemmata.length.toString + " number of lemmata...")
-        println(self.path.name+" was told to close...")
-        writeToDatabase(lemmata)
+        println(self.path.name+" was told to finish processing...")
+        context.actorSelection("/user/Logger") ! LogMessage("LemmaWorker",self.path.name,"sentBatch",System.currentTimeMillis().toString)
         sender ! LemmaDone
-        db.close()
-        context.stop(self)
       }
       case LemmaKey(lemmaKey) =>
       {
-        lemmata = lemmata :+ processLemma(lemmaKey,this.aLemmatizer)
-        if (lemmata.length == this.batchSize)
+        context.actorSelection("/user/Logger") ! LogMessage("LemmaWorker",self.path.name,"processLemmaStart",System.currentTimeMillis().toString)
+        var output = processLemma(lemmaKey,this.aLemmatizer)
+        output(0) match
         {
-          writeToDatabase(lemmata)
-          lemmata = List[List[String]]()
+          case null => {}
+          case _ =>
+          {
+            context.actorSelection("/user/DBLemmarouter") ! WriteToDB(this.insertString,List[List[Any]](List[String](output(3),output(2),output(1))),List[String]("string","string","string"))
+          }
         }
+        context.actorSelection("/user/Logger") ! LogMessage("LemmaWorker",self.path.name,"processLemmaFinish",System.currentTimeMillis().toString)
       }
     }
-  }
-
-  /** Open a db connection, run code, and then close the connection */
-  def workOnDatabase[A](url:String, username:String, password:String, workCode: Connection => A) : A = 
-  {
-    val driver = "com.mysql.jdbc.Driver"
-    val connection: Connection = DriverManager.getConnection(url, username, password)
-    val output = workCode(connection)
-    connection.close()
-    output
-  }
-
-  /** Normalise the database*/
-  def normalizeCorpus()(db: Connection): Unit =
-  {
-    println("Dropping the forms table...")
-    val dropTableStmt1: Statement = db.createStatement()
-    dropTableStmt1.executeUpdate("DROP TABLE IF EXISTS forms")
-
-    println("Recreating the forms table from tokens...")
-    val createTableStmt: Statement = db.createStatement()
-    createTableStmt.executeUpdate("CREATE TABLE forms SELECT tokens.form form, tokens.count count, tokens.POS POS, tokens.pageNum pageNum, metadata.id volumeID, lemmata.id lemmaID FROM tokens INNER JOIN metadata ON tokens.volumeId = metadata.volumeId INNER JOIN lemmata ON tokens.lemmaKey = lemmata.lemmaKey;")
-
-    println("Dropping now redundant tokens table...")
-    val dropTableStmt2: Statement = db.createStatement()
-    dropTableStmt2.executeUpdate("DROP TABLE IF EXISTS tokens")
-
-  }
-
-  /** Index the database*/
-  def indexCorpus()(db: Connection): Unit =
-  {
-    println("Adding the POS index on forms...")
-    val posIndexStmt: Statement = db.createStatement()
-    posIndexStmt.executeUpdate("CREATE INDEX POS on forms(POS)")
-
-    println("Adding the lemmaId index on forms...")
-    val lemmaIndexStmt: Statement = db.createStatement()
-    lemmaIndexStmt.executeUpdate("CREATE INDEX lemmaID on forms(lemmaID)")
-
-    println("Adding the volumeID index on forms...")
-    val volIndexStmt: Statement = db.createStatement()
-    volIndexStmt.executeUpdate("CREATE INDEX volumeID on forms(volumeID)")
-  }
-  /** Initialize database 
-   *
-   *  Delete tables if they exist and create new tables
-   *  */
-  def initialiseDatabase()(db: Connection): Unit =
-  {
-    println("Deleting the tables...")
-    val dropTableStmt1: Statement = db.createStatement()
-    dropTableStmt1.executeUpdate("DROP TABLE IF EXISTS tokens")
-    val dropTableStmt2: Statement = db.createStatement()
-    dropTableStmt2.executeUpdate("DROP TABLE IF EXISTS lemmata")
-    val dropTableStmt3: Statement = db.createStatement()
-    dropTableStmt3.executeUpdate("DROP TABLE IF EXISTS metadata")
-    val dropTableStmt4: Statement = db.createStatement()
-    dropTableStmt4.executeUpdate("DROP TABLE IF EXISTS forms")
-
-    println("Initialising tables...")
-    val createTableStmt1: Statement = db.createStatement()
-    createTableStmt1.executeUpdate("""CREATE TABLE tokens (
-                    form varchar(255) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL,
-                    count int NOT NULL,
-                    POS varchar(4) NOT NULL,
-                    volumeId varchar(255) NOT NULL,
-                    pageNum int NOT NULL,
-                    lemmaKey varchar(255) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL
-                )""")
-    val createTableStmt2: Statement = db.createStatement()
-    createTableStmt2.executeUpdate(""" CREATE TABLE lemmata (
-                    id int NOT NULL UNIQUE AUTO_INCREMENT,
-                    lemmaKey varchar(100) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL,
-                    lemma varchar(255) CHARACTER SET utf8 COLLATE utf8_bin,
-                    standard varchar(255) CHARACTER SET utf8 COLLATE utf8_bin,
-                    PRIMARY KEY (id)
-                )""")
-    val createTableStmt3: Statement = db.createStatement()
-    createTableStmt3.executeUpdate("""CREATE TABLE metadata (
-                    id int NOT NULL UNIQUE AUTO_INCREMENT,
-                    volumeId varchar(100) NOT NULL,
-                    title varchar(400) NOT NULL,
-                    pubDate int NOT NULL,
-                    pubPlace varchar(3) NOT NULL,
-                    imprint varchar(255) NOT NULL,
-                    genre  set('not fiction',
-                               'legal case and case notes',
-                               'government publication',
-                               'novel',
-                               'drama',
-                               'bibliography',
-                               'poetry',
-                               'biography',
-                               'catalog',
-                               'fiction',
-                               'statistics',
-                               'dictionary',
-                               'essay',
-                               'index') NOT NULL,
-                    names varchar(255) NOT NULL,
-                    PRIMARY KEY (id)
-                )""")
-
-    val setStmt1: Statement = db.createStatement()
-    setStmt1.executeUpdate("SET GLOBAL max_allowed_packet=1073741824")
-
   }
   main()
 }
