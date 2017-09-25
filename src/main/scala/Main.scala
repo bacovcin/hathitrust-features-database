@@ -8,10 +8,11 @@ import scala.io._
 import sys.process._
 
 // Import mutable sets for tracking unique lemmakeys
-import scala.collection.mutable.{Set => Set,Map => MMap}
+import scala.collection.mutable.{HashSet => Set,Map => MMap}
 
 // Import Try code to capture exceptions
 import scala.util.{Try, Success, Failure}
+import java.util.NoSuchElementException
 
 // Import the JDBC libraries
 import java.sql._
@@ -320,6 +321,7 @@ object Main extends App
           newbatch = List[String]()
         }
       }
+      this.databatches = this.databatches :+ newbatch
       filelist.close
     }
 
@@ -711,10 +713,8 @@ object Main extends App
    *  */
   class LemmaDispatcher extends Actor 
   {
-    var uniqueLemmaKeys: Set[String] = Set[String]()
-    var keysNeedingLemmas: List[String] = List[String]()
+    var uniqueLemmaKeys: Set[scala.Array[String]] = Set[scala.Array[String]]()
     var numWorkers = 0
-    var batches: List[List[String]] = List[List[String]](List[String]())
     var finishedWorkers: Int = 0
     var router = context.actorOf(RoundRobinPool(0).props(Props[LemmaWorker]), "dummyrouter")
 
@@ -731,11 +731,14 @@ object Main extends App
       case LemmaKeys(lemmaKeys) =>
       {
         context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","gotLemmaKeys",System.currentTimeMillis().toString)
-        val newLemmaKeys = lemmaKeys &~ uniqueLemmaKeys 
-        for (lemmaKey <- newLemmaKeys)
+        for (lemmaKey <- lemmaKeys)
         {
-          this.router ! LemmaKey(lemmaKey)
-          uniqueLemmaKeys = uniqueLemmaKeys + lemmaKey
+          var s = lemmaKey.split(":::")
+          if (!(uniqueLemmaKeys contains s))
+          {
+            this.router ! LemmaKey(lemmaKey)
+            uniqueLemmaKeys add s
+          }
         }
         context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","finishedLemmaKeys",System.currentTimeMillis().toString)
       }
