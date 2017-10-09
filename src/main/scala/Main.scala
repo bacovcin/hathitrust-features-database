@@ -29,14 +29,16 @@ import lemmatizer.MyLemmatizer
  *  inserts data into database and lemmatizes forms*/
 object Main extends App
 {
+  println(Runtime.getRuntime().maxMemory())
   // Database information
+  val txtloc = "/big/hathitrust-textfiles/"
   val url = "jdbc:mysql://localhost/hathitrust?rewriteBatchedStatements=true"
   val username = "hathitrust"
   val password = "hathitrust"
 
   // Batch size for database queries
-  val dataBatchSize = 20
-  val lemmaBatchSize = 2500
+  val dataBatchSize = 60
+  val lemmaBatchSize = 2501
 
   // Number of workers
   val numDataWorkers = 2 // Workers who read in files and insert data
@@ -47,13 +49,13 @@ object Main extends App
   sealed trait AkkaMessage
   case class StartMain(dataBatchSize: Int, lemmaBatchSize: Int, numDataWorkers: Int, numLemmaWorkers: Int) extends AkkaMessage
   case class StartLemma(lemmaBatchSize: Int, numLemmaWorkers: Int) extends AkkaMessage
+  case class DBInitialize(filename: String) extends AkkaMessage
   case class Initialize(batchSize: Int) extends AkkaMessage
   case class Lemmatise(lemmaKeys: List[String]) extends AkkaMessage 
   case class LemmaKey(lemmaKey: String) extends AkkaMessage
-  case class LemmaKeys(lemmaKeys: Set[String]) extends AkkaMessage
   case class Process(filename: String) extends AkkaMessage 
   case class Download(filenames: List[String]) extends AkkaMessage 
-  case class WriteToDB(queryString: String, queries: List[List[Any]], types: List[String]) extends AkkaMessage
+  case class WriteToDB(outputString: String) extends AkkaMessage
   case class LogMessage(processname: String,workerid:String, action: String, timestamp: String) extends AkkaMessage
   case object NeedWork extends AkkaMessage
   case object Close extends AkkaMessage
@@ -142,8 +144,11 @@ object Main extends App
     val lemmadispatcher = context.system.actorOf(Props[LemmaDispatcher],name="LemmaDispatcher")
     val downloader = context.system.actorOf(Props[Downloader],name="Downloader")
     val dbroutermeta = context.system.actorOf(Props[DBRouterWorker],name="DBMetarouter")
+	dbroutermeta ! DBInitialize("metadata.txt")
     val dbrouterlemma = context.system.actorOf(Props[DBRouterWorker],name="DBLemmarouter")
+	dbrouterlemma ! DBInitialize("lemmata.txt")
     val dbrouterdata = context.system.actorOf(Props[DBRouterWorker],name="DBDatarouter")
+	dbrouterdata ! DBInitialize("tokens.txt")
     val logger = context.system.actorOf(Props[Logger],name="Logger")
     var finishedWorkers: Int = 0
     var dbfinished = 0
@@ -162,6 +167,17 @@ object Main extends App
     /** Normalise the database*/
     def normalizeCorpus()(db: Connection): Unit =
     {
+      context.actorSelection("/user/Logger") ! LogMessage("normalizer","0","startingNormalization",System.currentTimeMillis().toString)
+	  println("Reading in data from text files...")
+      val readTableStmt1: Statement = db.createStatement()
+      readTableStmt1.executeUpdate("LOAD DATA LOCAL INFILE '"+txtloc+"tokens.txt' INTO TABLE tokens")
+      context.actorSelection("/user/Logger") ! LogMessage("normalizer","0","loadedtokens",System.currentTimeMillis().toString)
+      val readTableStmt2: Statement = db.createStatement()
+      readTableStmt2.executeUpdate("LOAD DATA LOCAL INFILE '"+txtloc+"lemmata.txt' INTO TABLE lemmata")
+      context.actorSelection("/user/Logger") ! LogMessage("normalizer","0","loadedlemmata",System.currentTimeMillis().toString)
+      val readTableStmt3: Statement = db.createStatement()
+      readTableStmt3.executeUpdate("LOAD DATA LOCAL INFILE '"+txtloc+"metadata.txt' INTO TABLE metadata")
+      context.actorSelection("/user/Logger") ! LogMessage("normalizer","0","loadedmetadata",System.currentTimeMillis().toString)
       println("Dropping the forms table...")
       context.actorSelection("/user/Logger") ! LogMessage("normalizer","0","dropforms",System.currentTimeMillis().toString)
       val dropTableStmt1: Statement = db.createStatement()
@@ -180,7 +196,7 @@ object Main extends App
       println("Recreating the forms table from tokens...")
       context.actorSelection("/user/Logger") ! LogMessage("normalizer","0","creatforms",System.currentTimeMillis().toString)
       val createTableStmt: Statement = db.createStatement()
-      createTableStmt.executeUpdate("CREATE TABLE forms SELECT tokens.form form, tokens.count count, tokens.POS POS, tokens.pageNum pageNum, metadata.id volumeID, lemmata.id lemmaID FROM tokens INNER JOIN metadata ON tokens.volumeId = metadata.volumeId INNER JOIN lemmata ON tokens.lemmaKey = lemmata.lemmaKey;")
+      createTableStmt.executeUpdate("CREATE TABLE forms SELECT tokens.form form, tokens.count count, tokens.POS POS, metadata.id volumeID, lemmata.id lemmaID FROM tokens INNER JOIN metadata ON tokens.volumeId = metadata.volumeId INNER JOIN lemmata ON tokens.lemmaKey = lemmata.lemmaKey;")
 
       println("Dropping now redundant tokens table...")
       context.actorSelection("/user/Logger") ! LogMessage("normalizer","0","droptokens",System.currentTimeMillis().toString)
@@ -243,7 +259,6 @@ object Main extends App
                       count int NOT NULL,
                       POS varchar(4) NOT NULL,
                       volumeId varchar(35) NOT NULL,
-                      pageNum int NOT NULL,
                       lemmaKey varchar(255) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL
                   )""")
       val createTableStmt2: Statement = db.createStatement()
@@ -281,8 +296,6 @@ object Main extends App
                  )""")
 
       val setStmt1: Statement = db.createStatement()
-      setStmt1.executeUpdate("SET GLOBAL max_allowed_packet=1073741824")
-
     }
     /** Recursively populate the list of dataworkers with workers*/
     def createDataWorkers(numWorkers: Int, curWorkerNum: Int): Unit =
@@ -311,7 +324,7 @@ object Main extends App
       val filelist = Source.fromFile("htrc-ef-all-files.txt")
       var newbatch = List[String]()
       val lines = filelist.getLines
-      for (i <- 1 until 100)
+      for (i <- 1 until 5001)
       {
         var line = lines.next
         newbatch = newbatch :+ line
@@ -375,6 +388,9 @@ object Main extends App
       {
         this.numWorkers = numDataWorkers
         createLemmaDispatcher(numLemmaWorkers, lemmaBatchSize)
+	  }
+	  case StartLemma =>
+	  {
         context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","startedSystem",System.currentTimeMillis().toString)
         workOnDatabase(url,username,password,initialiseDatabase())
         context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","initialisedDatabase",System.currentTimeMillis().toString)
@@ -410,10 +426,19 @@ object Main extends App
             context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","gotNewBatch",System.currentTimeMillis().toString)
             for (worker <- 1 until this.numWorkers+1)
             {
-              var head::tail = this.curbatch
-              println(worker)
-              context.actorSelection("/user/DataWorker"+worker.toString) ! Process(head)
-              this.curbatch = tail
+			  try
+			  {
+                var head::tail = this.curbatch
+                println(worker)
+                context.actorSelection("/user/DataWorker"+worker.toString) ! Process(head)
+                this.curbatch = tail
+			  } catch
+			  {
+			    case e: scala.MatchError =>
+				{
+                  context.actorSelection("/user/DataWorker"+worker.toString) ! DataDone
+				}
+			  }
             }
           } else
           {
@@ -442,7 +467,6 @@ object Main extends App
         } else
         {
           context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","finishedDataBatch",System.currentTimeMillis().toString)
-          for (worker <- 1 until this.numWorkers)
           this.finishedWorkers += 1
           if (finishedWorkers == dataworkers.length)
           {
@@ -457,98 +481,20 @@ object Main extends App
 
   class DBRouterWorker extends Actor
   {
-    val writeLength = 5000
-    val numDBWriters = 2
-    val myrouter = context.actorOf(RoundRobinPool(numDBWriters).props(Props[DBWriter]), self.path.name+"Router")
-    var finishedWorkers = 0
-    var outputList = List[List[Any]]()
-    var outputString = ""
-    var outputTypes = List[String]()
-    var outputCount = 0
+    var myfile = new PrintWriter(new File("temp.txt"))
     def receive = 
     {
-      case WriteToDB(queryString: String, queries: List[List[Any]],types: List[String]) =>
+	  case DBInitialize(filename: String) =>
+	  {
+	  	this.myfile = new PrintWriter(new File(txtloc + filename))
+	  }
+      case WriteToDB(outputString) =>
       {
-        outputString = queryString
-        outputTypes = types
-        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","queryRecieved",System.currentTimeMillis().toString)
-        outputList = outputList :+ queries(0)
-        outputCount += queries.length
-        if (outputCount >= writeLength)
-        {
-          myrouter ! WriteToDB(queryString,outputList,types)
-          outputList = List[List[Any]]()
-          outputCount = 0
-        }
-        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","queryProcessed",System.currentTimeMillis().toString)
+        this.myfile.write(outputString+"\n")
       }
       case Finished =>
       {
-        myrouter ! WriteToDB(outputString,outputList,outputTypes)
-        myrouter ! Broadcast(Finished)
-      }
-      case DBFinished =>
-      {
-        this.finishedWorkers += 1
-        if (this.finishedWorkers == this.numDBWriters)
-        {
-          context.actorSelection("/user/MainDispatcher") ! DBFinished
-          this.finishedWorkers = 0
-        }
-      }
-    }
-  }
-
-  /** Writes out a log code to a log file */
-  class DBWriter extends Actor
-  {
-    val driver = "com.mysql.jdbc.Driver"
-    val db: Connection = DriverManager.getConnection(url, username, password)
-    def receive = 
-    {
-      case WriteToDB(queryString: String, queries: List[List[Any]],types: List[String]) =>
-      {
-        context.actorSelection("/user/Logger") ! LogMessage("DBWriter",self.path.name,"queryRecieved",System.currentTimeMillis().toString)
-        val queryStmt: PreparedStatement = db.prepareStatement(queryString)
-        var isFirst = true
-        for (query <- queries)
-        {
-          if (isFirst)
-          {
-            isFirst = false
-          } else
-          {
-            queryStmt.addBatch()
-          }
-          for (i <- 0 until types.length)
-          {
-            if (types(i) == "string")
-            {
-              queryStmt.setString(i+1,query(i).asInstanceOf[String])
-            } else if (types(i) == "int")
-            {
-              queryStmt.setInt(i+1,query(i).asInstanceOf[Int])
-            } else
-            {
-              println("You passed an illegal type: " + types(i))
-              context.system.terminate()
-            }
-          }
-        }
-        if (queries.length == 1)
-        {
-          queryStmt.executeUpdate()
-        } else
-        {
-          queryStmt.executeBatch()
-        }
-        queryStmt.close()
-        context.actorSelection("/user/Logger") ! LogMessage("DBWriter",self.path.name,"queryCompleted",System.currentTimeMillis().toString)
-      }
-      case Finished =>
-      {
-        context.actorSelection("/user/Logger") ! LogMessage("DBWriter",self.path.name,"shutdown",System.currentTimeMillis().toString)
-        sender ! DBFinished
+        context.actorSelection("/user/MainDispatcher") ! DBFinished
       }
     }
   }
@@ -557,7 +503,6 @@ object Main extends App
    *  lemma dispatcher*/
   class DataWorker extends Actor
   {
-    var uniqueCheckBatchSize = 100
     // A Map for converting POS tags into Morphadorner classes:
     val posdict: Map[String,List[String]] =
       scala.collection.immutable.Map(
@@ -618,6 +563,10 @@ object Main extends App
     // Deal with messages
     def receive =
     {
+	  case DataDone =>
+	  {
+	    sender ! NeedWork
+	  }
       // Get a file to process
       case Process(file) =>
       {
@@ -633,8 +582,7 @@ object Main extends App
           val volID = curmeta("volumeIdentifier").asInstanceOf[String].replace("'","''")
           val year = curmeta("pubDate").asInstanceOf[String].toInt
           // Deal with metadata
-          val insertMetaString: String = "INSERT INTO metadata (volumeId,title,pubDate,pubPlace,imprint,genre,names) VALUES (?,?,?,?,?,(?),?)"
-          context.actorSelection("/user/DBMetarouter") ! WriteToDB(insertMetaString,List[List[Any]](List[Any](volID,curmeta("title").asInstanceOf[String].replace("'","''"),year,curmeta("pubPlace").asInstanceOf[String],curmeta("imprint").asInstanceOf[String].replace("'","''"),curmeta("genre").asInstanceOf[List[String]].mkString(","),curmeta("names").asInstanceOf[List[String]].mkString(";").replace("'","''"))),List[String]("string","string","int","string","string","string","string"))
+          context.actorSelection("/user/DBMetarouter") ! WriteToDB(List[String](volID,curmeta("title").asInstanceOf[String].replace("'","''"),year.toString,curmeta("pubPlace").asInstanceOf[String],curmeta("imprint").asInstanceOf[String].replace("'","''"),curmeta("genre").asInstanceOf[List[String]].mkString(","),curmeta("names").asInstanceOf[List[String]].mkString(";").replace("'","''")).mkString("\t"))
           var corpus = ""
           if (year < 1700)
           {
@@ -648,47 +596,45 @@ object Main extends App
           }
 
           // Get tokens
-          val insertTokenString: String = "INSERT INTO tokens (form,count,POS,volumeId,pageNum,lemmaKey) VALUES (?,?,?,?,?,?)"
-          var batchCount: Int = 0
           val pages = volfile("features").asInstanceOf[Map[Any,Any]]("pages").asInstanceOf[List[Map[Any,Any]]]
           context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"getPages",System.currentTimeMillis().toString)
-          var curUniqueLemmaKeys: Set[String] = Set[String]()
-          var oldUniqueLemmaKeys: Set[String] = Set[String]()
+		  var forms = MMap[scala.Array[String],BigInt]()
           for (page <- pages)
           {
-            var tokens = page("body").asInstanceOf[Map[Any,Any]]("tokenPosCount").asInstanceOf[Map[Any,Any]]
+            var tokens = page("body").asInstanceOf[Map[String,Any]]("tokenPosCount").asInstanceOf[Map[String,Any]]
             for (form <- tokens.keys)
             {
               var poses = tokens(form).asInstanceOf[Map[String,BigInt]]
               for (pos <- poses.keys)
               {
-                var newpos = pos.stripPrefix("$")
-                try
-                {
-                  var wc = posdict(newpos)
-                  var lemmaKey = form.asInstanceOf[String].replace("'","''")+":::"+wc(1)+":::"+wc(0)+":::"+corpus
-                  if (!(oldUniqueLemmaKeys contains lemmaKey))
-                  {
-                    curUniqueLemmaKeys = curUniqueLemmaKeys + lemmaKey
-                  }
-                  var newToken = List[Any](form.asInstanceOf[String].replace("'","''"),poses(pos).toInt,newpos.replace("'","''"),volID,page("seq").asInstanceOf[String].toInt,lemmaKey)
-                  context.actorSelection("/user/DBDatarouter") ! WriteToDB(insertTokenString,List[List[Any]](newToken),List[String]("string","int","string","string","int","string"))
-                  batchCount = batchCount + 1
-                  if (batchCount == uniqueCheckBatchSize)
-                  {
-                    context.actorSelection("/user/LemmaDispatcher") ! LemmaKeys(curUniqueLemmaKeys)
-                    oldUniqueLemmaKeys = oldUniqueLemmaKeys union curUniqueLemmaKeys
-                    curUniqueLemmaKeys = Set[String]()
-                    batchCount = 0
-                  }
-                } catch
-                {
-                  case e : Exception => {}
-                }
+			    try
+				{
+				  forms(scala.Array(form,pos.stripPrefix("$"))) += poses(pos)
+				} catch
+				{
+				  case e: Exception =>
+				  {
+				    forms(scala.Array(form,pos.stripPrefix("$"))) = poses(pos)
+				  }
+				}
               }
             }
           }
-          context.actorSelection("/user/LemmaDispatcher") ! LemmaKeys(curUniqueLemmaKeys)
+		  for (key <- forms.keys)
+		  {
+		    try
+		    {
+			  var form = key(0)
+			  var newpos = key(1)
+              var wc = posdict(newpos)
+              var lemmaKey = form+":::"+wc(1)+":::"+wc(0)+":::"+corpus
+              context.actorSelection("/user/LemmaDispatcher") ! LemmaKey(lemmaKey)
+			  context.actorSelection("/user/DBDatarouter") ! WriteToDB(List[String](form.replace("'","''"),forms(key).toString,newpos.replace("'","''"),volID,lemmaKey).mkString("\t"))
+		  	} catch
+			{
+              case e : Exception => {}
+		 	}
+		  }
         }
         context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"finishedWithFile",System.currentTimeMillis().toString)
         println(self.path.name + " finished processing "+file+"...")
@@ -728,25 +674,32 @@ object Main extends App
         this.router ! Broadcast(Initialize(batchSize))
       }
       // Send lemma keys on to the workers after checking for uniqueness
-      case LemmaKeys(lemmaKeys) =>
+      case LemmaKey(lemmaKey) =>
       {
-        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","gotLemmaKeys",System.currentTimeMillis().toString)
-        for (lemmaKey <- lemmaKeys)
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","gotLemmaKey",System.currentTimeMillis().toString)
+        var s = lemmaKey.split(":::")
+        if (!(uniqueLemmaKeys contains s))
         {
-          var s = lemmaKey.split(":::")
-          if (!(uniqueLemmaKeys contains s))
-          {
-            this.router ! LemmaKey(lemmaKey)
-            uniqueLemmaKeys add s
-          }
+          this.router ! LemmaKey(lemmaKey)
+          uniqueLemmaKeys add s
         }
-        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","finishedLemmaKeys",System.currentTimeMillis().toString)
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","finishedLemmaKey",System.currentTimeMillis().toString)
       }
       // Tell the lemma workers to ignore batch size, since they won't get more data
       case DataDone =>
       {
         this.router ! Broadcast(Finished) 
       }
+	  case Finished =>
+	  {
+        finishedWorkers += 1
+        if (finishedWorkers == this.numWorkers)
+        {
+          context.actorSelection("/user/MainDispatcher") ! StartLemma
+          finishedWorkers = 0
+        }
+	  
+	  }
       // Collect workers finishing to send final message back to the main dispatcher
       case LemmaDone =>
       {
@@ -764,7 +717,6 @@ object Main extends App
    *  inserts new lemmadata in database*/
   class LemmaWorker extends Actor {
     var aLemmatizer = new MyLemmatizer()
-    val insertString: String = "INSERT lemmata (lemmaKey, lemma, standard) VALUES (?, ?, ?)"
 
     def processLemma(lemmaKey: String, aLemmatizer: MyLemmatizer): List[String] = 
     {
@@ -795,6 +747,7 @@ object Main extends App
       case Initialize(batchSize: Int) =>
       {
         this.aLemmatizer.initialise()
+		sender ! Finished
       }
       case Finished =>
       {
@@ -811,7 +764,7 @@ object Main extends App
           case null => {}
           case _ =>
           {
-            context.actorSelection("/user/DBLemmarouter") ! WriteToDB(this.insertString,List[List[Any]](List[String](output(3),output(2),output(1))),List[String]("string","string","string"))
+            context.actorSelection("/user/DBLemmarouter") ! WriteToDB(List[String](output(3),output(2),output(1)).mkString("\t"))
           }
         }
         context.actorSelection("/user/Logger") ! LogMessage("LemmaWorker",self.path.name,"processLemmaFinish",System.currentTimeMillis().toString)
