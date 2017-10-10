@@ -3,12 +3,13 @@ import java.io._
 import org.apache.commons.compress.compressors.bzip2._
 import net.liftweb.json._
 import scala.io._
+import com.madhukaraphatak.sizeof.SizeEstimator
 
 // Import code to run shell commands (rsync)
 import sys.process._
 
 // Import mutable sets for tracking unique lemmakeys
-import scala.collection.mutable.{HashSet => Set,Map => MMap}
+import scala.collection.mutable.{HashSet => MSet,Map => MMap}
 
 // Import Try code to capture exceptions
 import scala.util.{Try, Success, Failure}
@@ -31,7 +32,7 @@ object Main extends App
 {
   println(Runtime.getRuntime().maxMemory())
   // Database information
-  val txtloc = "/big/hathitrust-textfiles/"
+  val txtloc = "/home/hbacovci/hathitrust-textfiles/"
   val url = "jdbc:mysql://localhost/hathitrust?rewriteBatchedStatements=true"
   val username = "hathitrust"
   val password = "hathitrust"
@@ -53,6 +54,7 @@ object Main extends App
   case class Initialize(batchSize: Int) extends AkkaMessage
   case class Lemmatise(lemmaKeys: List[String]) extends AkkaMessage 
   case class LemmaKey(lemmaKey: String) extends AkkaMessage
+  case class GoodLemmaKey(lemmaKey: String,outputList: String) extends AkkaMessage
   case class Process(filename: String) extends AkkaMessage 
   case class Download(filenames: List[String]) extends AkkaMessage 
   case class WriteToDB(outputString: String) extends AkkaMessage
@@ -324,7 +326,7 @@ object Main extends App
       val filelist = Source.fromFile("htrc-ef-all-files.txt")
       var newbatch = List[String]()
       val lines = filelist.getLines
-      for (i <- 1 until 5001)
+      for (i <- 1 until 2001)
       {
         var line = lines.next
         newbatch = newbatch :+ line
@@ -659,7 +661,7 @@ object Main extends App
    *  */
   class LemmaDispatcher extends Actor 
   {
-    var uniqueLemmaKeys: Set[scala.Array[String]] = Set[scala.Array[String]]()
+    var uniqueLemmaKeys: MMap[String,MSet[String]] = MMap[String,MSet[String]]()
     var numWorkers = 0
     var finishedWorkers: Int = 0
     var router = context.actorOf(RoundRobinPool(0).props(Props[LemmaWorker]), "dummyrouter")
@@ -677,17 +679,40 @@ object Main extends App
       case LemmaKey(lemmaKey) =>
       {
         context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","gotLemmaKey",System.currentTimeMillis().toString)
-        var s = lemmaKey.split(":::")
-        if (!(uniqueLemmaKeys contains s))
+        var myform = lemmaKey.split(":::")(0)
+        if (!(uniqueLemmaKeys contains myform))
         {
           this.router ! LemmaKey(lemmaKey)
-          uniqueLemmaKeys add s
+        } else
+        {
+          if (!(uniqueLemmaKeys(myform) contains lemmaKey))
+          {
+            this.router ! LemmaKey(lemmaKey)
+          }
         }
         context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","finishedLemmaKey",System.currentTimeMillis().toString)
+      }
+      // Only add actual lemmas to the map (ignore errata since they are likely to be hapax)
+      case GoodLemmaKey(lemmaKey,outputString) =>
+      {
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","gotGoodLemmaKey",System.currentTimeMillis().toString)
+        var myform = lemmaKey.split(":::")(0)
+        if (!(uniqueLemmaKeys contains myform))
+        {
+          context.actorSelection("/user/DBLemmarouter") ! WriteToDB(outputString)
+        } else
+        {
+          if (!(uniqueLemmaKeys(myform) contains lemmaKey))
+          {
+            context.actorSelection("/user/DBLemmarouter") ! WriteToDB(outputString)
+          }
+        }
+        context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","finishedGoodLemmaKey",System.currentTimeMillis().toString)
       }
       // Tell the lemma workers to ignore batch size, since they won't get more data
       case DataDone =>
       {
+        println("Set Size: " + (SizeEstimator.estimate(this.uniqueLemmaKeys).toFloat / 1073741824.0).toString + "GB")
         this.router ! Broadcast(Finished) 
       }
 	  case Finished =>
@@ -764,7 +789,7 @@ object Main extends App
           case null => {}
           case _ =>
           {
-            context.actorSelection("/user/DBLemmarouter") ! WriteToDB(List[String](output(3),output(2),output(1)).mkString("\t"))
+          sender ! GoodLemmaKey(lemmaKey,List[String](output(3),output(2),output(1)).mkString("\t"))
           }
         }
         context.actorSelection("/user/Logger") ! LogMessage("LemmaWorker",self.path.name,"processLemmaFinish",System.currentTimeMillis().toString)
