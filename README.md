@@ -11,7 +11,7 @@ MariaDB
 ## Instructions for use
 Before running the software make sure you unzip the morphadorner-2.0.1.zip in the morphadorner folder.
 
-1) Download the hathitrust filelist: rsync -azv data.analytics.hathitrust.org::features/listing/htrc-ef-all-files.txt .
+1) Run the python code to download and split the filelist: python split-hathitrust.py
 
 2) Run the scala code to build the MariaDB, remove non-English data and OCR errors, and add in lemmata: sbt -J-d64 -J-Xmx16G -J-XX:-UseGCOverheadLimit run
 
