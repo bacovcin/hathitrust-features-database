@@ -18,5 +18,5 @@ for line in infile:
     if i % 10000 == 0:
         print(j)
         j += 1
-        curout = open("filelists/list"+str(j)+'.txt', 'w')
+        curout = open("filelists/list-"+str(j)+'.txt', 'w')
     curout.write(line)
