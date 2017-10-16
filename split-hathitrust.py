@@ -11,7 +11,7 @@ i = 0
 j = 1
 
 # Write out each set of 10000 files as their own list
-curout = open("filelists/list"+str(j)+'.txt', 'w')
+curout = open("filelists/list-"+str(j)+'.txt', 'w')
 print(j)
 for line in infile:
     i += 1
