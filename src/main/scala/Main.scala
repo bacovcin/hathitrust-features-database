@@ -32,17 +32,22 @@ object Main extends App
 {
   println(Runtime.getRuntime().maxMemory())
   // Database information
-  val txtloc = "/big/hathitrust-textfiles/"
+  if (args.length == 0) 
+  {
+        println("You need to provide the location of the filelist for processing!")
+  }
+  val batchnumber: String = args(0)
+  val txtloc = "/home/hbacovci/GitHub/hathitrust-features-database/outputs/"
   val url = "jdbc:mysql://localhost/hathitrust?rewriteBatchedStatements=true"
   val username = "hathitrust"
   val password = "hathitrust"
 
   // Batch size for database queries
-  val dataBatchSize = 1000
+  val dataBatchSize = args(1).toInt
 
   // Number of workers
-  val numDataWorkers = 4 // Workers who read in files and insert data
-  val numLemmaWorkers = 6 // Workers who perform lemmatization
+  val numDataWorkers = args(2).toInt // Workers who read in files and insert data
+  val numLemmaWorkers = args(3).toInt // Workers who perform lemmatization
 
 
   // Messages for the Akka workers to send to one another
@@ -144,13 +149,14 @@ object Main extends App
     val lemmadispatcher = context.system.actorOf(Props[LemmaDispatcher],name="LemmaDispatcher")
     val downloader = context.system.actorOf(Props[Downloader],name="Downloader")
     val dbroutermeta = context.system.actorOf(Props[DBRouterWorker],name="DBMetarouter")
-	dbroutermeta ! DBInitialize("metadata.txt")
+	dbroutermeta ! DBInitialize("metadata/"+batchnumber+".txt")
     val dbrouterlemma = context.system.actorOf(Props[DBRouterWorker],name="DBLemmarouter")
-	dbrouterlemma ! DBInitialize("lemmata.txt")
+	dbrouterlemma ! DBInitialize("lemmata/"+batchnumber+".txt")
     val dbrouterdata = context.system.actorOf(Props[DBRouterWorker],name="DBDatarouter")
-	dbrouterdata ! DBInitialize("tokens.txt")
+	dbrouterdata ! DBInitialize("tokens/"+batchnumber+".txt")
 //    val logger = context.system.actorOf(Props[Logger],name="Logger")
     var finishedWorkers: Int = 0
+    var dbClosed: Int = 0
     var dbfinished = 0
     var notLastBatch: Boolean = true
 
@@ -321,9 +327,9 @@ object Main extends App
     def createBatches(dataBatchSize: Int) : Unit =
     {
       println("Loading file list...")
-      val filelist = Source.fromFile("htrc-ef-all-files.txt")
+      val filelistfile = Source.fromFile("filelists/list-"+batchnumber+".txt")
       var newbatch = List[String]()
-      val lines = filelist.getLines
+      val lines = filelistfile.getLines
       for (line <- lines)
       {
         newbatch = newbatch :+ line
@@ -334,7 +340,7 @@ object Main extends App
         }
       }
       this.databatches = this.databatches :+ newbatch
-      filelist.close
+      filelistfile.close
     }
 
     // Download a batch (and the first time download the next batch as well)
@@ -393,7 +399,6 @@ object Main extends App
         //context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","startedSystem",System.currentTimeMillis().toString)
         workOnDatabase(url,username,password,initialiseDatabase())
         //context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","initialisedDatabase",System.currentTimeMillis().toString)
-        "rsync -azv data.analytics.hathitrust.org::features/listing/htrc-ef-all-files.txt .".!
         createBatches(dataBatchSize)
         //context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","createdBatches",System.currentTimeMillis().toString)
         getNextBatch(true)
@@ -438,16 +443,23 @@ object Main extends App
 				}
 			  }
             }
-          } else
+          } else if (dbClosed == 0)
           {
+            this.dbfinished = 0
             for (worker <- 1 until this.numWorkers)
             {
               context.actorSelection("/user/DataWorker"+worker.toString) ! Close
             }
-            println("Starting normalizing...")
-            workOnDatabase(url,username,password,normalizeCorpus())
-            println("Starting indexing...")
-            workOnDatabase(url,username,password,indexCorpus())
+	        dbrouterdata ! DBFinished
+	        dbrouterlemma ! DBFinished
+	        dbroutermeta ! DBFinished
+            dbClosed = 1
+          } else
+          {
+            //println("Starting normalizing...")
+            //workOnDatabase(url,username,password,normalizeCorpus())
+            //println("Starting indexing...")
+            //workOnDatabase(url,username,password,indexCorpus())
             println("Shutting down...")
             //context.actorSelection("/user/Logger") ! Finished
             context.system.terminate()
@@ -492,6 +504,11 @@ object Main extends App
       }
       case Finished =>
       {
+        context.actorSelection("/user/MainDispatcher") ! DBFinished
+      }
+      case DBFinished =>
+      {
+        this.myfile.close()
         context.actorSelection("/user/MainDispatcher") ! DBFinished
       }
     }
