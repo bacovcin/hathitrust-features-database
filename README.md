@@ -13,7 +13,7 @@ Before running the software make sure you unzip the morphadorner-2.0.1.zip in th
 
 1) Run the python code to download and split the filelist: python split-hathitrust.py
 
-2) Run the scala code to build the MariaDB, remove non-English data and OCR errors, and add in lemmata: sbt -J-d64 -J-Xmx16G -J-XX:-UseGCOverheadLimit run
+2) Run the scala code to build the MariaDB, remove non-English data and OCR errors, and add in lemmata: make all
 
 ## Example query
 This query gets a list of all the past tense clauses by lemma, standardized spelling, place of publication and year of publication:
