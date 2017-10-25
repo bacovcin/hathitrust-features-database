@@ -37,7 +37,7 @@ object Main extends App
         println("You need to provide the location of the filelist for processing!")
   }
   val batchnumber: String = args(0)
-  val txtloc = "/home/hbacovci/GitHub/hathitrust-features-database/outputs/"
+  val txtloc = "/big/hathitrust-textfiles/"
   val url = "jdbc:mysql://localhost/hathitrust?rewriteBatchedStatements=true"
   val username = "hathitrust"
   val password = "hathitrust"
@@ -93,7 +93,7 @@ object Main extends App
       samplefile.write(file+'\n') 
     }
     samplefile.close
-    val syncstring = "rsync -av --no-relative --files-from "+samplename+" data.analytics.hathitrust.org::features/ ."
+    val syncstring = "rsync -a --no-relative --files-from "+samplename+" data.analytics.hathitrust.org::features/ ."
     syncstring.!
         
     val rmstring = "rm "+samplename 
@@ -397,7 +397,7 @@ object Main extends App
 	  case StartLemma =>
 	  {
         //context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","startedSystem",System.currentTimeMillis().toString)
-        workOnDatabase(url,username,password,initialiseDatabase())
+        //workOnDatabase(url,username,password,initialiseDatabase())
         //context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","initialisedDatabase",System.currentTimeMillis().toString)
         createBatches(dataBatchSize)
         //context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","createdBatches",System.currentTimeMillis().toString)
