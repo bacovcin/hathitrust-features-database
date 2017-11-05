@@ -586,65 +586,67 @@ object Main extends App
       case Process(file) =>
       {
         //context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"processStart",System.currentTimeMillis().toString)
-        val volstream = Source.fromInputStream(new BZip2CompressorInputStream(new BufferedInputStream(new FileInputStream(file)))).getLines.next
-        //context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"openedFile",System.currentTimeMillis().toString)
-        val volfile = parse(volstream).values.asInstanceOf[Map[Any,Any]]
-        //context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"parsedFile",System.currentTimeMillis().toString)
-        val curmeta = volfile("metadata").asInstanceOf[Map[Any,Any]]
-        // Only use English data
-        if (curmeta("language").asInstanceOf[String] == "eng")
-        {
-          val volID = curmeta("volumeIdentifier").asInstanceOf[String].replace("'","''")
-          val year = curmeta("pubDate").asInstanceOf[String].toInt
-          // Deal with metadata
-          context.actorSelection("/user/DBMetarouter") ! WriteToDB(List[String](volID,curmeta("title").asInstanceOf[String].replace("'","''"),year.toString,curmeta("pubPlace").asInstanceOf[String],curmeta("imprint").asInstanceOf[String].replace("'","''"),curmeta("genre").asInstanceOf[List[String]].mkString(","),curmeta("names").asInstanceOf[List[String]].mkString(";").replace("'","''")).mkString("\t"))
-          var corpus = ""
-          if (year < 1700)
+        try
+		{
+          val volstream = Source.fromInputStream(new BZip2CompressorInputStream(new BufferedInputStream(new FileInputStream(file)))).getLines.next
+          //context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"openedFile",System.currentTimeMillis().toString)
+          val volfile = parse(volstream).values.asInstanceOf[Map[Any,Any]]
+          //context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"parsedFile",System.currentTimeMillis().toString)
+          val curmeta = volfile("metadata").asInstanceOf[Map[Any,Any]]
+          // Only use English data
+          if (curmeta("language").asInstanceOf[String] == "eng")
           {
-            corpus = "eme"
-          } else if (year < 1800)
-          {
-            corpus = "ece" 
-          } else
-          {
-            corpus = "ncf"
-          }
-
-          // Get tokens
-          val pages = volfile("features").asInstanceOf[Map[Any,Any]]("pages").asInstanceOf[List[Map[Any,Any]]]
-          //context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"getPages",System.currentTimeMillis().toString)
-		  var forms = MMap[scala.Array[String],BigInt]()
-          for (page <- pages)
-          {
-            var tokens = page("body").asInstanceOf[Map[String,Any]]("tokenPosCount").asInstanceOf[Map[String,Any]]
-            for (form <- tokens.keys)
+            val volID = curmeta("volumeIdentifier").asInstanceOf[String].replace("'","''")
+            val year = curmeta("pubDate").asInstanceOf[String].toInt
+            // Deal with metadata
+            context.actorSelection("/user/DBMetarouter") ! WriteToDB(List[String](volID,curmeta("title").asInstanceOf[String].replace("'","''"),year.toString,curmeta("pubPlace").asInstanceOf[String],curmeta("imprint").asInstanceOf[String].replace("'","''"),curmeta("genre").asInstanceOf[List[String]].mkString(","),curmeta("names").asInstanceOf[List[String]].mkString(";").replace("'","''")).mkString("\t"))
+            var corpus = ""
+            if (year < 1700)
             {
-              var poses = tokens(form).asInstanceOf[Map[String,BigInt]]
-              for (pos <- poses.keys)
+              corpus = "eme"
+            } else if (year < 1800)
+            {
+              corpus = "ece" 
+            } else
+            {
+              corpus = "ncf"
+            }
+
+            // Get tokens
+            val pages = volfile("features").asInstanceOf[Map[Any,Any]]("pages").asInstanceOf[List[Map[Any,Any]]]
+            //context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"getPages",System.currentTimeMillis().toString)
+	  	  var forms = MMap[scala.Array[String],BigInt]()
+            for (page <- pages)
+            {
+              var tokens = page("body").asInstanceOf[Map[String,Any]]("tokenPosCount").asInstanceOf[Map[String,Any]]
+              for (form <- tokens.keys)
               {
-			    try
-				{
-				  forms(scala.Array(form,pos.stripPrefix("$"))) += poses(pos)
-				} catch
-				{
-				  case e: Exception =>
-				  {
-				    forms(scala.Array(form,pos.stripPrefix("$"))) = poses(pos)
-				  }
-				}
+                var poses = tokens(form).asInstanceOf[Map[String,BigInt]]
+                for (pos <- poses.keys)
+                {
+	  		    try
+	  			{
+	  			  forms(scala.Array(form,pos.stripPrefix("$"))) += poses(pos)
+	  			} catch
+	  			{
+	  			  case e: Exception =>
+	  			  {
+	  			    forms(scala.Array(form,pos.stripPrefix("$"))) = poses(pos)
+	  			  }
+	  			}
+                }
               }
             }
-          }
-		  for (key <- forms.keys)
-		  {
-		    try
-		    {
-			  var form = key(0)
-			  var newpos = key(1)
-              var wc = posdict(newpos)
-              var lemmaKey = form+":::"+wc(1)+":::"+wc(0)+":::"+corpus
-              context.actorSelection("/user/LemmaDispatcher") ! LemmaKey(lemmaKey)
-			  context.actorSelection("/user/DBDatarouter") ! WriteToDB(List[String](form.replace("'","''"),forms(key).toString,newpos.replace("'","''"),volID,lemmaKey).mkString("\t"))
+	  	  for (key <- forms.keys)
+	  	  {
+	  	    try
+	  	    {
+	  		  var form = key(0)
+	  		  var newpos = key(1)
+                var wc = posdict(newpos)
+                var lemmaKey = form+":::"+wc(1)+":::"+wc(0)+":::"+corpus
+                context.actorSelection("/user/LemmaDispatcher") ! LemmaKey(lemmaKey)
+	  		  context.actorSelection("/user/DBDatarouter") ! WriteToDB(List[String](form.replace("'","''"),forms(key).toString,newpos.replace("'","''"),volID,lemmaKey).mkString("\t"))
 		  	} catch
 			{
               case e : Exception => {}
@@ -657,6 +659,15 @@ object Main extends App
         val rmstring = "rm "+file 
         rmstring.! 
         //context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"removedFile",System.currentTimeMillis().toString)
+		} catch
+		{
+		  case e: FileNotFoundException =>
+          {
+            //context.actorSelection("/user/Logger") ! LogMessage("DataWorker",self.path.name,"finishedWithFile",System.currentTimeMillis().toString)
+            //println(self.path.name + " finished processing "+file+"...")
+		    sender ! NeedWork
+		  }
+		}
       }
       case Close =>
       {
@@ -747,6 +758,7 @@ object Main extends App
         if (finishedWorkers == this.numWorkers)
         {
           context.actorSelection("/user/MainDispatcher") ! LemmaDone
+    	  uniqueLemmaKeys = MMap[String,MSet[String]]()
           finishedWorkers = 0
         }
       }
