@@ -25,11 +25,8 @@ import scala.concurrent.duration._
 // Get code to deal with file removal
 import sys.process._
 
-// Get code to deal with lemmatization
-import lemmatizer.MyLemmatizer
-
 /** Downloads the Hathitrust Extracted Features Files, extracts English data,
- *  inserts data into database and lemmatizes forms*/
+ *  inserts data into database*/
 object Main extends App
 {
   println(Runtime.getRuntime().maxMemory())
@@ -39,32 +36,21 @@ object Main extends App
         println("You need to provide the location of the filelist for processing!")
   }
   val batchnumber: String = args(0)
-  val txtloc = "/big/hathitrust-textfiles/"
-  val url = "jdbc:mysql://localhost/hathitrust?rewriteBatchedStatements=true"
-  val username = "hathitrust"
-  val password = "hathitrust"
+  val txtloc = "hathitrust-textfiles/"
 
   // Number of workers
   val numDataWorkers = args(1).toInt // Workers who read in files and insert data
-  val numLemmaWorkers = args(2).toInt // Workers who perform lemmatization
 
   // Memory Buffer Size
-  val maxMem = args(3).toInt // Maximum memory as back pressure (in GB)
+  val maxMem = args(2).toInt // Maximum memory as back pressure (in GB)
 
   // Initial wait time
-  val waitTime = args(4).toInt // Initial amount of time to wait before checking if memory has decreased
-
-  // Initial wait time
-  val maxHapax = args(5).toInt // Initial amount of time to wait before checking if memory has decreased
+  val waitTime = args(3).toInt // Initial amount of time to wait before checking if memory has decreased
 
   // Messages for the Akka workers to send to one another
   sealed trait AkkaMessage
-  case class StartMain(numDataWorkers: Int, numLemmaWorkers: Int) extends AkkaMessage
-  case class StartLemma(numLemmaWorkers: Int) extends AkkaMessage
+  case class StartMain(numDataWorkers: Int) extends AkkaMessage
   case class DBInitialize(filename: String) extends AkkaMessage
-  case class Lemmatise(lemmaKeys: List[String]) extends AkkaMessage 
-  case class LemmaKey(lemmaKey: String) extends AkkaMessage
-  case class GoodLemmaKey(lemmaKey: String,outputList: String) extends AkkaMessage
   case class Process(filename: String) extends AkkaMessage 
   case class WriteToDB(outputString: String) extends AkkaMessage
   case class LogMessage(processname: String,workerid:String, action: String, timestamp: String) extends AkkaMessage
@@ -72,7 +58,6 @@ object Main extends App
   case object Initialize extends AkkaMessage
   case object NeedWork extends AkkaMessage
   case object Close extends AkkaMessage
-  case object LemmaDone extends AkkaMessage
   case object DataDone extends AkkaMessage
   case object Finished extends AkkaMessage
   case object FinishedFile extends AkkaMessage
@@ -85,7 +70,7 @@ object Main extends App
     val master = system.actorOf(Props[MainDispatcher],name="MainDispatcher")
 
     // Start the main Akka actor
-    master ! StartMain( numDataWorkers, numLemmaWorkers)
+    master ! StartMain( numDataWorkers)
   }
 
   /** Distributes files to data workers  
@@ -103,11 +88,8 @@ object Main extends App
     var dataworkers = context.actorOf(RoundRobinPool(0).props(Props[DataWorker]), "dummyrouter")
     var maxNumWorkers: Int = 0
     var curNumWorkers: Int = 0
-    val lemmadispatcher = context.system.actorOf(Props[LemmaDispatcher],name="LemmaDispatcher")
     val dbroutermeta = context.system.actorOf(Props[DBRouterWorker],name="DBMetarouter")
 	dbroutermeta ! DBInitialize("metadata/"+batchnumber+"-new.txt")
-    val dbrouterlemma = context.system.actorOf(Props[DBRouterWorker],name="DBLemmarouter")
-	dbrouterlemma ! DBInitialize("lemmata/"+batchnumber+"-new.txt")
     val dbrouterdata = context.system.actorOf(Props[DBRouterWorker],name="DBDatarouter")
 	dbrouterdata ! DBInitialize("tokens/"+batchnumber+"-new.txt")
     var finishedWorkers: Int = 0
@@ -125,27 +107,20 @@ object Main extends App
 	  this.dataworkers = context.actorOf(RoundRobinPool(numWorkers).props(Props[DataWorker]), "router")
     }
 
-    /** Create the lemma dispatcher*/
-    def createLemmaDispatcher(numLemmaWorkers: Int): Unit =
-    {
-      context.actorSelection("/user/LemmaDispatcher") ! StartLemma(numLemmaWorkers)
-    }
-
     /** Split the filelist into download batches*/
     def createBatches() : Unit =
     {
       println("Loading file list...")
-      val filelistfile = Source.fromFile("new-filelists/list-"+batchnumber+".txt")
+      val filelistfile = Source.fromFile("filelists/list-"+batchnumber+".txt")
       this.curbatch = filelistfile.getLines.toList
 	  this.remainingFiles = this.curbatch.length
       filelistfile.close
 	  println("Finished loading file list...")
-	  var i: Int = this.maxNumWorkers
-	  while ( i > 0)
+	  context.system.scheduler.scheduleOnce(waitTime milliseconds)
 	  {
-	  	self ! NeedWork
-		i -= 1
+		self ! NeedWork
 	  }
+	  self ! NeedWork
     }
 
     /** Perform task for each message */
@@ -153,18 +128,12 @@ object Main extends App
     {
       // Create the database structure, create the actors, and initialise the
       // batches
-      case StartMain(numDataWorkers, numLemmaWorkers) =>
+      case StartMain(numDataWorkers) =>
       {
         this.maxNumWorkers = numDataWorkers
         createDataWorkers(numDataWorkers)
-        createLemmaDispatcher(numLemmaWorkers)
-	  }
-
-	  case StartLemma =>
-	  {
         createBatches()
-      }
-
+	  }
 
       // Send the next file in the batch to the data actor
       case NeedWork =>
@@ -175,17 +144,20 @@ object Main extends App
         {
 		  if (this.currentMem < maxMem)
 		  {
-		    while ((this.curNumWorkers < this.maxNumWorkers) && 
-			       (this.curbatch.length > 0) &&
-				   (this.currentMem < maxMem))
-			{
+            if ((this.curNumWorkers < this.maxNumWorkers) &&
+                (this.curbatch.length > 0))
+            {
           	  val head::tail = this.curbatch
           	  this.dataworkers ! Process(head)
           	  this.curbatch = tail
 			  this.filesProcessed += 1
 			  this.curNumWorkers += 1
 			  this.currentMem = ((myRuntime.totalMemory - myRuntime.freeMemory) / this.gb)
-			}
+	          context.system.scheduler.scheduleOnce(10 milliseconds)
+	          {
+		        self ! NeedWork
+	          }
+            }
 		  } else
 		  {
 		    if (this.curNumWorkers == 0)
@@ -216,7 +188,7 @@ object Main extends App
 	  case FinishedFile =>
 	  {
 	    this.remainingFiles -= 1
-		if (this.remainingFiles % 100 == 0)
+		if (this.remainingFiles % 10 == 0)
 		{
 	      val myRuntime = Runtime.getRuntime
 		  this.currentMem = ((myRuntime.totalMemory - myRuntime.freeMemory) / this.gb)
@@ -239,26 +211,16 @@ object Main extends App
 	  	this.finishedWorkers += 1
 		if (this.finishedWorkers == this.maxNumWorkers)
 		{
-      	  context.actorSelection("/user/LemmaDispatcher") ! DataDone
+          this.dbroutermeta ! DBFinished
+          this.dbrouterdata ! DBFinished
 		}
 	  }
-
-      // Learn that all the work has been sent to the database writers, 
-	  // wait for the database writing to be finished before normalizing and indexing
-      case LemmaDone =>
-      {
-        //context.actorSelection("/user/Logger") ! LogMessage(self.path.name,"0","finishedLemmaBatch",System.currentTimeMillis().toString)
-        println("Lemmatization batch finished...")
-        this.dbroutermeta ! DBFinished
-        this.dbrouterdata ! DBFinished
-        this.dbrouterlemma ! DBFinished
-      }
 
       // Learn that all the work is done and do finishing touches on database and quit
       case DBFinished =>
       {
         this.dbfinished += 1
-        if (this.dbfinished == 3)
+        if (this.dbfinished == 2)
         {
           println("Shutting down...")
           context.system.terminate()
@@ -395,7 +357,6 @@ object Main extends App
 	  		  var newpos = key(1)
               var wc = posdict(newpos)
               var lemmaKey = form+":::"+wc(1)+":::"+wc(0)+":::"+corpus
-              context.actorSelection("/user/LemmaDispatcher") ! LemmaKey(lemmaKey)
 	  		  context.actorSelection("/user/DBDatarouter") ! WriteToDB(List[String](form.replace("'","''"),forms(key).toString,newpos.replace("'","''"),volID,lemmaKey).mkString("\t"))
 		  	} catch
 			{
@@ -422,161 +383,6 @@ object Main extends App
     }
   }
 
-  /** Distributes lemma keys to lemma workers for lemmatization  
-   *
-   *  Receives lemmakeys from data workers, checks if they are unique,
-   *  sends unique lemmakeys to lemma workers for lemmatization
-   *  */
-  class LemmaDispatcher extends Actor 
-  {
-    var firstLemmaKeys: MSet[String] = MSet[String]()
-	var lemmaCount: Int = 0
-    var uniqueLemmaKeys: MMap[String,MSet[String]] = MMap[String,MSet[String]]()
-    var numWorkers = 0
-    var finishedWorkers: Int = 0
-    var router = context.actorOf(RoundRobinPool(0).props(Props[LemmaWorker]), "dummyrouter")
-
-    def receive = 
-    {
-      // Create the lemma workers
-      case StartLemma(numWorkers) =>
-      {
-        this.numWorkers = numWorkers
-        this.router = context.actorOf(RoundRobinPool(numWorkers).props(Props[LemmaWorker]), "router")
-        this.router ! Broadcast(Initialize)
-      }
-      // Send lemma keys on to the workers after checking for uniqueness
-      case LemmaKey(lemmaKey) =>
-      {
-        var myform = lemmaKey.split(":::")(0)
-		if (firstLemmaKeys contains lemmaKey)
-		{
-		  firstLemmaKeys remove lemmaKey
-          if (!(uniqueLemmaKeys contains myform))
-          {
-		    uniqueLemmaKeys(myform) = MSet[String](lemmaKey)
-          } else
-          {
-            if (!(uniqueLemmaKeys(myform) contains lemmaKey))
-            {
-			  uniqueLemmaKeys(myform) add lemmaKey
-            }
-          }
-		} else
-		{
-          if (!(uniqueLemmaKeys contains myform))
-          {
-            this.router ! LemmaKey(lemmaKey)
-          } else
-          {
-            if (!(uniqueLemmaKeys(myform) contains lemmaKey))
-            {
-              this.router ! LemmaKey(lemmaKey)
-            }
-          }
-		}
-      }
-
-      // Only add actual lemmas to the map (ignore errata since they are likely to be hapax)
-      case GoodLemmaKey(lemmaKey,outputString) =>
-      {
-	    this.lemmaCount += 1
-		if (this.lemmaCount == maxHapax)
-		{
-		  firstLemmaKeys = MSet[String]()
-          println("Set Size: " + (SizeEstimator.estimate(this.uniqueLemmaKeys).toFloat / 1073741824.0).toString + "GB")
-		  this.lemmaCount = 0
-		}
-        context.actorSelection("/user/DBLemmarouter") ! WriteToDB(outputString)
-		firstLemmaKeys add lemmaKey
-      }
-      // Tell the lemma workers to ignore batch size, since they won't get more data
-      case DataDone =>
-      {
-        println("Set Size: " + (SizeEstimator.estimate(this.uniqueLemmaKeys).toFloat / 1073741824.0).toString + "GB")
-        this.router ! Broadcast(Finished) 
-      }
-	  case Finished =>
-	  {
-        finishedWorkers += 1
-        if (finishedWorkers == this.numWorkers)
-        {
-          context.actorSelection("/user/MainDispatcher") ! StartLemma
-          finishedWorkers = 0
-        }
-	  }
-      // Collect workers finishing to send final message back to the main dispatcher
-      case LemmaDone =>
-      {
-        finishedWorkers += 1
-        if (finishedWorkers == this.numWorkers)
-        {
-          context.actorSelection("/user/MainDispatcher") ! LemmaDone
-    	  uniqueLemmaKeys = MMap[String,MSet[String]]()
-          finishedWorkers = 0
-        }
-      }
-    }
-  }
-
-  /** Receives lemmakeys from LemmaDispatcher, performs lemmatisation,
-   *  inserts new lemmadata in database*/
-  class LemmaWorker extends Actor {
-    var aLemmatizer = new MyLemmatizer()
-
-    def processLemma(lemmaKey: String, aLemmatizer: MyLemmatizer): List[String] = 
-    {
-      // Break the lemmaKey into the form, major word class,
-      // lemma word class, and corpus
-      val components = lemmaKey.split(":::")
-
-      // Use corpus appropriate lemmatizer
-      val myoutput = components(3) match
-      {
-        case "eme" => aLemmatizer.emeLemmatise(components)
-        case "ece" => aLemmatizer.eceLemmatise(components)
-        case "ncf" => aLemmatizer.ncfLemmatise(components)
-        case _ => null
-      }
-      myoutput match
-      {
-        case null => List[String](null)
-        case _ => 
-        {
-          myoutput.toList :+ lemmaKey
-        }
-      }
-    }
-
-    def receive = 
-    {
-      case Initialize =>
-      {
-        this.aLemmatizer.initialise()
-		sender ! Finished
-      }
-      case Finished =>
-      {
-        println(self.path.name+" was told to finish processing...")
-        //context.actorSelection("/user/Logger") ! LogMessage("LemmaWorker",self.path.name,"sentBatch",System.currentTimeMillis().toString)
-        sender ! LemmaDone
-      }
-      case LemmaKey(lemmaKey) =>
-      {
-        //context.actorSelection("/user/Logger") ! LogMessage("LemmaWorker",self.path.name,"processLemmaStart",System.currentTimeMillis().toString)
-        var output = processLemma(lemmaKey,this.aLemmatizer)
-        output(0) match
-        {
-          case null => {}
-          case _ =>
-          {
-          sender ! GoodLemmaKey(lemmaKey,List[String](output(3),output(2),output(1)).mkString("\t"))
-          }
-        }
-        //context.actorSelection("/user/Logger") ! LogMessage("LemmaWorker",self.path.name,"processLemmaFinish",System.currentTimeMillis().toString)
-      }
-    }
-  }
 
   class DBRouterWorker extends Actor
   {
